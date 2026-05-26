@@ -2,6 +2,12 @@
 name = "nef-compactor"
 version = "0.1.0"
 edition = "2024"
+description = "Lossless NEF compressor — re-encodes Nikon raw files with JPEG XL for 20-40% smaller files, with bit-perfect decompression"
+license = "MIT"
+repository = "https://github.com/pimlu/nef-compactor"
+readme = "README.md"
+keywords = ["nikon", "nef", "raw", "compression"]
+categories = ["command-line-utilities", "compression", "multimedia::images"]
 
 [dependencies]
 jpegxl-rs = { version = "0.11", features = ["vendored"] }
@@ -16,7 +22,12 @@ path = "src/main.rs"
 [[bin]]
 name = "roundtrip-test"
 path = "src/bin/roundtrip_test.rs"
+required-features = ["debug-tools"]
 
 [[bin]]
 name = "dump-raw"
 path = "src/bin/dump_raw.rs"
+required-features = ["debug-tools"]
+
+[features]
+debug-tools = []
