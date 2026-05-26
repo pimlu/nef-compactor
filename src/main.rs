@@ -31,8 +31,9 @@ fn usage() -> ! {
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
     eprintln!("             --rm: remove original .NEF after verified write (incompatible with --skip-verify)");
     eprintln!("             -v: show per-segment breakdown");
-    eprintln!("  decompress [-R] <file.CNEF|dir> [output]");
+    eprintln!("  decompress [-R] [-j N] [--rm] <file.CNEF|dir> [output]");
     eprintln!("             -R: decompress all CNEFs in a directory");
+    eprintln!("             --rm: remove original .CNEF after writing .NEF");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
 }
@@ -491,17 +492,38 @@ impl StreamState {
 
 fn cmd_decompress_main(args: &[String]) {
     let mut recursive = false;
+    let mut remove_originals = false;
+    let mut jobs = 1usize;
     let mut positional = Vec::new();
 
-    for arg in args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "-R" => recursive = true,
-            _ => positional.push(arg.clone()),
+            "--rm" => remove_originals = true,
+            "-j" => {
+                i += 1;
+                jobs = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("-j requires a number");
+                        std::process::exit(1);
+                    });
+            }
+            _ if args[i].starts_with("-j") => {
+                jobs = args[i][2..].parse().unwrap_or_else(|_| {
+                    eprintln!("-j requires a number");
+                    std::process::exit(1);
+                });
+            }
+            _ => positional.push(args[i].clone()),
         }
+        i += 1;
     }
 
     if positional.is_empty() {
-        eprintln!("usage: nef-compactor decompress [-R] <input.CNEF|dir> [output]");
+        eprintln!("usage: nef-compactor decompress [-R] [-j N] [--rm] <input.CNEF|dir> [output]");
         std::process::exit(1);
     }
 
@@ -516,53 +538,218 @@ fn cmd_decompress_main(args: &[String]) {
             );
             std::process::exit(1);
         }
-        let out_dir = output.as_deref().unwrap_or(&input);
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&input)
-            .expect("read directory")
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("CNEF") {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        files.sort();
-
-        if files.is_empty() {
-            eprintln!("no CNEF files found in {}", input.display());
-            std::process::exit(1);
-        }
-
-        for f in &files {
-            let stem = f.file_stem().unwrap().to_string_lossy();
-            let out_path = out_dir.join(format!("{stem}.NEF"));
-            decompress_one(f, &out_path);
-        }
+        cmd_decompress_dir(&input, output.as_deref(), jobs, remove_originals);
     } else {
         if recursive {
             eprintln!("error: -R requires a directory, not a file");
             std::process::exit(1);
         }
         let out_path = output.unwrap_or_else(|| input.with_extension("NEF"));
-        decompress_one(&input, &out_path);
+        match decompress_one(&input) {
+            Ok(r) => {
+                write_and_sync(&out_path, &r.nef_data).expect("write output NEF");
+                if remove_originals {
+                    std::fs::remove_file(&input).expect("remove original CNEF");
+                }
+                println!(
+                    "{} → {} ({} bytes)",
+                    r.input_name,
+                    out_path.file_name().unwrap().to_string_lossy(),
+                    r.original_size,
+                );
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", input.display());
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-fn decompress_one(input: &Path, output: &Path) {
-    let mut cnef_file = std::fs::File::open(input).expect("open input CNEF");
-    let mut out_file = std::fs::File::create(output).expect("create output NEF");
+struct DecompressResult {
+    input_name: String,
+    original_size: u64,
+    nef_data: Vec<u8>,
+}
 
-    let stats =
-        nef_compactor::cnef::decompress(&mut cnef_file, &mut out_file).expect("decompress");
+fn decompress_one(input: &Path) -> Result<DecompressResult, String> {
+    let mut cnef_file =
+        std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
+    let mut nef_buf = Vec::new();
 
+    let stats = nef_compactor::cnef::decompress(&mut cnef_file, &mut nef_buf)?;
+
+    Ok(DecompressResult {
+        input_name: input.file_name().unwrap().to_string_lossy().to_string(),
+        original_size: stats.original_size,
+        nef_data: nef_buf,
+    })
+}
+
+fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_originals: bool) {
+    let out_dir = output.unwrap_or(dir);
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("read directory")
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("CNEF") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("no CNEF files found in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    let out_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|f| {
+            let stem = f.file_stem().unwrap().to_string_lossy();
+            out_dir.join(format!("{stem}.NEF"))
+        })
+        .collect();
+
+    let n = files.len();
+    let state = DecompressStreamState::new(n);
+
+    if jobs <= 1 {
+        for i in 0..n {
+            let result = decompress_one(&files[i]);
+            state.publish(i, result);
+            state.drain(&files, &out_paths, remove_originals);
+        }
+    } else {
+        let next_idx = Mutex::new(0usize);
+
+        std::thread::scope(|scope| {
+            let drainer = scope.spawn(|| {
+                state.drain_blocking(n, &files, &out_paths, remove_originals);
+            });
+
+            for _ in 0..jobs {
+                scope.spawn(|| loop {
+                    let idx = {
+                        let mut next = next_idx.lock().unwrap();
+                        if *next >= n {
+                            return;
+                        }
+                        let i = *next;
+                        *next += 1;
+                        i
+                    };
+
+                    let result = decompress_one(&files[idx]);
+                    state.publish(idx, result);
+                });
+            }
+
+            drainer.join().unwrap();
+        });
+    }
+
+    let inner = state.inner.lock().unwrap();
     println!(
-        "{} → {} ({} bytes)",
-        input.file_name().unwrap().to_string_lossy(),
-        output.file_name().unwrap().to_string_lossy(),
-        stats.original_size,
+        "\nSummary: {} decompressed, {} failed, {} total",
+        inner.succeeded, inner.failed, n,
     );
+}
+
+struct DecompressStreamState {
+    inner: Mutex<DecompressStreamInner>,
+    cond: Condvar,
+}
+
+struct DecompressStreamInner {
+    slots: Vec<Option<Result<DecompressResult, String>>>,
+    next_print: usize,
+    succeeded: u64,
+    failed: u64,
+}
+
+impl DecompressStreamState {
+    fn new(n: usize) -> Self {
+        DecompressStreamState {
+            inner: Mutex::new(DecompressStreamInner {
+                slots: (0..n).map(|_| None).collect(),
+                next_print: 0,
+                succeeded: 0,
+                failed: 0,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, idx: usize, result: Result<DecompressResult, String>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots[idx] = Some(result);
+        self.cond.notify_all();
+    }
+
+    fn drain(
+        &self,
+        files: &[PathBuf],
+        out_paths: &[PathBuf],
+        remove_originals: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        while inner.next_print < inner.slots.len() {
+            let idx = inner.next_print;
+            let Some(result) = inner.slots[idx].take() else {
+                break;
+            };
+            inner.next_print += 1;
+
+            match result {
+                Ok(r) => {
+                    if let Err(e) = write_and_sync(&out_paths[idx], &r.nef_data) {
+                        eprintln!("{}: write failed ({e})", r.input_name);
+                        inner.failed += 1;
+                        continue;
+                    }
+                    if remove_originals {
+                        if let Err(e) = std::fs::remove_file(&files[idx]) {
+                            eprintln!("{}: remove failed ({e})", r.input_name);
+                        }
+                    }
+                    inner.succeeded += 1;
+                    println!(
+                        "{} → {} ({} bytes)",
+                        r.input_name,
+                        out_paths[idx].file_name().unwrap().to_string_lossy(),
+                        r.original_size,
+                    );
+                }
+                Err(e) => {
+                    let name = files[idx].file_name().unwrap().to_string_lossy();
+                    eprintln!("{name}: failed ({e})");
+                    inner.failed += 1;
+                }
+            }
+        }
+    }
+
+    fn drain_blocking(
+        &self,
+        n: usize,
+        files: &[PathBuf],
+        out_paths: &[PathBuf],
+        remove_originals: bool,
+    ) {
+        loop {
+            self.drain(files, out_paths, remove_originals);
+            let inner = self.inner.lock().unwrap();
+            if inner.next_print >= n {
+                return;
+            }
+            let _unused = self.cond.wait(inner).unwrap();
+        }
+    }
 }
 
 // ─── Info ────────────────────────────────────────────────────────────────────

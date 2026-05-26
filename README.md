@@ -1,22 +1,21 @@
-# nef-compactor
+# nef-ompactor
 
-Lossless compression for Nikon NEF files. Produces `.CNEF` files that are 20-40% smaller than the originals and decompress back to byte-identical NEFs.
+nef-compactor losslessly compresses classic Nikon NEF raws. Produces `.CNEF` files that are smaller than the original `.NEF` raws but can be decompressed back into the exact `.NEF` raw.  No data is deleted.
 
-Uses JPEG XL for raw sensor data and embedded JPEGs, zstd for metadata. No patent-encumbered codecs — HE/HE\* NEFs (which use JPEG XS internally) are detected and skipped.
+The compression ratio depends on the content of the files -- fundamentally noise is incompressible, so the less noise, the better:
 
-## How it works
+ * Bright/low ISO: Should fit something like 40% more photos on the same SD card.
+ * Dark/noisy: Might fit 10%-25% more photos on the same SD card.
 
-A NEF is a TIFF container holding a few large chunks: raw sensor data (~20-25 MB), a camera-rendered JPEG (~1-3 MB), thumbnail JPEGs, and TIFF/EXIF/MakerNote metadata. nef-compactor splits the file at chunk boundaries and compresses each piece with the best available codec:
+Works by re-encoding the raw data/JPEG thumbnails with lossless JPEG XL, which is completely free for open source software to use.
 
-| Chunk | Strategy | Typical ratio |
-|---|---|---|
-| Raw strip (14-bit Bayer) | Nikon lossless decode → Bayer deinterleave → JXL lossless | 79-96% |
-| Embedded JPEGs | JXL JPEG recompression (bit-perfect) | 71-91% |
-| Metadata skeleton | zstd | 40-90% |
+## HE/HE★ FAQ
 
-On decompression, the raw strip is re-encoded back to Nikon's lossless format using the same Huffman tables and prediction scheme, producing an identical bitstream. The output is byte-for-byte identical to the original NEF.
+nef-compactor *does not support HE/HE★* files, since no open-source software does.  It's patent-encumbered, meaning if you're not careful, even a clean room reverse engineered implementation can violate somebody's patents.
 
-Compression ratio depends heavily on ISO — low-ISO images (clean data, high spatial correlation) compress much better than high-ISO images (noisy, less redundancy).
+### Why is HE/HE★ smaller than nef-compactor?
+
+It's actually a lossy format, they're throwing data away to get that compression.
 
 ## Usage
 
@@ -25,16 +24,16 @@ Compression ratio depends heavily on ISO — low-ISO images (clean data, high sp
 nef-compactor compress photo.NEF
 
 # Preview compression ratios without writing anything
-nef-compactor compress --dry-run -e3 -R ~/Photos/
+nef-compactor compress --dry-run -R ~/Photos/
 
-# Compress a directory (8 threads, effort 3)
-nef-compactor compress -R -e3 -j8 ~/Photos/
+# Compress a directory (8 threads)
+nef-compactor compress -R -j8 ~/Photos/
 
 # Compress and remove originals after verified write
-nef-compactor compress -R -e3 -j8 --rm ~/Photos/
+nef-compactor compress -R -j8 --rm ~/Photos/
 
 # Verbose output showing per-segment breakdown
-nef-compactor compress -R -e3 -j8 -v ~/Photos/
+nef-compactor compress -R -j8 -v ~/Photos/
 
 # Decompress a single file
 nef-compactor decompress photo.CNEF
@@ -51,28 +50,14 @@ nef-compactor info photo.NEF
 | Flag | Description |
 |---|---|
 | `-R` | Operate on all NEF/CNEF files in a directory |
-| `-e N` | JXL effort 1 (fastest) to 10 (slowest), default 3 |
 | `-j N` | Number of parallel threads |
 | `--dry-run` | Show ratios without writing files |
 | `--skip-verify` | Skip roundtrip verification (faster, less safe) |
 | `--rm` | Remove original `.NEF` after verified, fsynced write. Incompatible with `--skip-verify` |
 | `-v` | Show per-segment compression breakdown |
 
-## Building
+## Disclaimer
 
-```
-cargo build --release
-```
+I've done my best to make sure this can't destroy your data.  It verifies that decompression successfully restores your `.NEF` file to its exact original form before deleting it.  It also flushes the `.CNEF` to disk before rm'ing the `.NEF` file.  But I'm not perfect, and I wrote various chunks of this with the help of Claude too.
 
-Requires a C compiler for the vendored libjxl.
-
-## Source layout
-
-| File | Purpose |
-|---|---|
-| `src/main.rs` | CLI, batch processing, streaming output |
-| `src/nef.rs` | NEF/TIFF scanner, chunk extraction, JPEG XS detection |
-| `src/tiff.rs` | Minimal TIFF/IFD parser (including Nikon MakerNote) |
-| `src/nikon_lossless.rs` | Nikon lossless codec (decoder + encoder) |
-| `src/jxl.rs` | JPEG XL wrapper (raw pixel encoding, JPEG recompression) |
-| `src/cnef.rs` | CNEF container format (compress/decompress/segment table) |
+So of course, use your own judgement and verify it works yourself before commiting large photo libraries to it.
