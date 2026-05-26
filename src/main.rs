@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -9,16 +9,24 @@ fn main() {
     match args[1].as_str() {
         "compress" | "c" => {
             if args.len() < 3 {
-                eprintln!("usage: nef-compactor compress <input.NEF> [output.cnef]");
+                eprintln!("usage: nef-compactor compress <input.NEF | directory> [output.cnef | output_dir]");
                 std::process::exit(1);
             }
             let input = PathBuf::from(&args[2]);
-            let output = if args.len() > 3 {
-                PathBuf::from(&args[3])
+            let output = args.get(3).map(PathBuf::from);
+
+            if input.is_dir() {
+                cmd_compress_dir(&input, output.as_deref());
             } else {
-                input.with_extension("cnef")
-            };
-            cmd_compress(&input, &output);
+                let out = output.unwrap_or_else(|| input.with_extension("cnef"));
+                match compress_one(&input, &out) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("{}: {e}", input.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         "decompress" | "d" => {
             if args.len() < 3 {
@@ -48,47 +56,50 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   <input.NEF> [output.cnef]   Compress NEF to CNEF");
-    eprintln!("  decompress <input.cnef> [output.NEF]   Decompress CNEF to NEF");
-    eprintln!("  info       <input.NEF>                 Show NEF chunk layout");
+    eprintln!("  compress   <input.NEF | dir> [output]   Compress NEF(s) to CNEF");
+    eprintln!("  decompress <input.cnef> [output.NEF]    Decompress CNEF to NEF");
+    eprintln!("  info       <input.NEF>                  Show NEF chunk layout");
     std::process::exit(1);
 }
 
-fn cmd_compress(input: &PathBuf, output: &PathBuf) {
-    let mut nef_file = std::fs::File::open(input).expect("open input NEF");
-    let chunks = nef_compactor::nef::scan_nef(&mut nef_file).expect("scan NEF");
+fn compress_one(input: &Path, output: &Path) -> Result<(), String> {
+    let mut nef_file =
+        std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
+    let chunks = nef_compactor::nef::scan_nef(&mut nef_file)?;
 
     let lossless_meta = if chunks.raw_strip.compression
         == nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS
     {
-        Some(
-            nef_compactor::nef::read_nikon_lossless_meta(&mut nef_file, &chunks)
-                .expect("read compression metadata"),
-        )
+        match nef_compactor::nef::read_nikon_lossless_meta(&mut nef_file, &chunks) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("  warning: can't read lossless meta ({e}), raw strip will use zstd");
+                None
+            }
+        }
     } else {
         None
     };
 
-    let mut out_file = std::fs::File::create(output).expect("create output CNEF");
+    let mut out_file =
+        std::fs::File::create(output).map_err(|e| format!("create output: {e}"))?;
     let stats = nef_compactor::cnef::compress(
         &mut nef_file,
         &chunks,
         lossless_meta.as_ref(),
         &mut out_file,
-    )
-    .expect("compress");
+    )?;
 
-    let cnef_size = std::fs::metadata(output).expect("stat output").len();
+    let cnef_size = std::fs::metadata(output)
+        .map_err(|e| format!("stat output: {e}"))?
+        .len();
     let ratio = cnef_size as f64 / stats.original_size as f64;
 
     println!(
-        "{} → {}",
+        "{} → {} ({:.1}%)",
         input.file_name().unwrap().to_string_lossy(),
         output.file_name().unwrap().to_string_lossy(),
-    );
-    println!(
-        "  total: {} → {} bytes ({:.1}%)",
-        stats.original_size, cnef_size, ratio * 100.0,
+        ratio * 100.0,
     );
     for seg in &stats.segments {
         let label = match seg.seg_type {
@@ -104,6 +115,78 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf) {
         println!(
             "    {:<10} {:>10} → {:>10} ({:.1}%)",
             label, seg.original_size, seg.compressed_size, seg_ratio,
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_compress_dir(dir: &Path, output_dir: Option<&Path>) {
+    let out_dir = output_dir.unwrap_or(dir);
+    if !out_dir.exists() {
+        std::fs::create_dir_all(out_dir).expect("create output directory");
+    }
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("read directory")
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("NEF") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("no NEF files found in {}", dir.display());
+        std::process::exit(1);
+    }
+
+    let mut compressed = 0u64;
+    let mut skipped = 0u64;
+    let mut failed = 0u64;
+    let mut total_original = 0u64;
+    let mut total_cnef = 0u64;
+
+    for file in &files {
+        let stem = file.file_stem().unwrap().to_string_lossy();
+        let out = out_dir.join(format!("{stem}.cnef"));
+
+        match compress_one(file, &out) {
+            Ok(()) => {
+                let orig = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+                let cnef = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                total_original += orig;
+                total_cnef += cnef;
+                compressed += 1;
+            }
+            Err(e) => {
+                eprintln!("{}: skipped ({e})", file.file_name().unwrap().to_string_lossy());
+                failed += 1;
+            }
+        }
+    }
+
+    let total_ratio = if total_original > 0 {
+        total_cnef as f64 / total_original as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    println!();
+    println!(
+        "Summary: {} compressed, {} skipped/failed, {} total",
+        compressed,
+        failed + skipped,
+        files.len(),
+    );
+    if compressed > 0 {
+        println!(
+            "  total: {} → {} bytes ({:.1}%)",
+            total_original, total_cnef, total_ratio,
         );
     }
 }
