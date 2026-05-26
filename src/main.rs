@@ -124,6 +124,8 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) {
 }
 
 fn cmd_info(input: &PathBuf) {
+    use std::io::{Read, Seek, SeekFrom};
+
     let mut file = std::fs::File::open(input).expect("open input");
     let chunks = nef_compactor::nef::scan_nef(&mut file).expect("scan NEF");
 
@@ -141,6 +143,47 @@ fn cmd_info(input: &PathBuf) {
         println!(
             "  {:?}: offset={:#x} length={} ({}x{})",
             jpeg.label, jpeg.offset, jpeg.length, jpeg.width, jpeg.height,
+        );
+    }
+
+    if chunks.raw_strip.compression == nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS {
+        let meta =
+            nef_compactor::nef::read_nikon_lossless_meta(&mut file, &chunks).expect("read meta");
+        file.seek(SeekFrom::Start(chunks.raw_strip.offset)).unwrap();
+        let mut compressed = vec![0u8; chunks.raw_strip.length as usize];
+        file.read_exact(&mut compressed).unwrap();
+
+        let w = chunks.raw_strip.width as usize;
+        let h = chunks.raw_strip.height as usize;
+        let pixels = nef_compactor::nikon_lossless::decode(
+            &compressed, w, h, chunks.raw_strip.bits_per_sample,
+            meta.huff_select, meta.initial_predictors, meta.split_row,
+        ).expect("decode");
+
+        let half_w = w / 2;
+        let half_h = h / 2;
+        let mut min_delta: i32 = 0;
+        let mut max_delta: i32 = 0;
+        let mut sum_abs: u64 = 0;
+
+        for row in 0..half_h {
+            for col in 0..half_w {
+                let g1 = pixels[(row * 2) * w + (col * 2 + 1)] as i32;
+                let g2 = pixels[(row * 2 + 1) * w + (col * 2)] as i32;
+                let delta = g1 - g2;
+                min_delta = min_delta.min(delta);
+                max_delta = max_delta.max(delta);
+                sum_abs += delta.unsigned_abs() as u64;
+            }
+        }
+
+        let count = (half_w * half_h) as f64;
+        let max_abs = max_delta.abs().max(min_delta.abs()) as u32;
+        let bits_needed = if max_abs == 0 { 0 } else { 32 - max_abs.leading_zeros() };
+
+        println!(
+            "  G delta: range [{}, +{}], avg |delta|={:.1}, bits needed={}",
+            min_delta, max_delta, sum_abs as f64 / count, bits_needed,
         );
     }
 }

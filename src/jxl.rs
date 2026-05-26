@@ -69,9 +69,13 @@ pub fn decode_jpeg(jxl_data: &[u8]) -> Result<Vec<u8>, String> {
 
 // ─── Bayer deinterleave / reinterleave ───────────────────────────────────────
 
-/// Deinterleave Bayer mosaic into 4-channel interleaved buffer (ABCD ABCD ...).
-/// Channel 0: (even_row, even_col), Channel 1: (even_row, odd_col),
-/// Channel 2: (odd_row, even_col),  Channel 3: (odd_row, odd_col).
+/// Deinterleave Bayer mosaic into 4-channel interleaved buffer.
+/// ch0: (even_row, even_col), ch1: (even_row, odd_col),
+/// ch2: (odd_row, even_col),  ch3: (odd_row, odd_col).
+///
+/// All 4 Bayer phases become separate channels at half resolution,
+/// letting JXL's predictors see spatially coherent data and exploit
+/// cross-channel correlations.
 fn bayer_deinterleave(mosaic: &[u16], width: usize, height: usize) -> Vec<u16> {
     let half_w = width / 2;
     let half_h = height / 2;
