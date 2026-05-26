@@ -15,3 +15,7 @@ path = "src/main.rs"
 [[bin]]
 name = "roundtrip-test"
 path = "src/bin/roundtrip_test.rs"
+
+[[bin]]
+name = "dump-raw"
+path = "src/bin/dump_raw.rs"

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -37,9 +37,10 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] <input | dir> [output]");
+    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [-v] <input | dir> [output]");
     eprintln!("             effort: 1 (fastest) to 10 (slowest), default 3");
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
+    eprintln!("             -v: show per-segment breakdown");
     eprintln!("  decompress <input.cnef> [output.NEF]");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
@@ -52,6 +53,7 @@ struct CompressOpts {
     effort: i64,
     dry_run: bool,
     skip_verify: bool,
+    verbose: bool,
     input: PathBuf,
     output: Option<PathBuf>,
 }
@@ -69,6 +71,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut effort = 3i64;
     let mut dry_run = false;
     let mut skip_verify = false;
+    let mut verbose = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -78,6 +81,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
             "-e" => effort = parse_num_after_flag(args, &mut i, "-e").unwrap(),
             "--dry-run" => dry_run = true,
             "--skip-verify" => skip_verify = true,
+            "-v" | "--verbose" => verbose = true,
             _ if args[i].starts_with("-j") => {
                 jobs = args[i][2..].parse().unwrap_or_else(|_| {
                     eprintln!("-j requires a number");
@@ -96,7 +100,9 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     }
 
     if positional.is_empty() {
-        eprintln!("usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] <input> [output]");
+        eprintln!(
+            "usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [-v] <input> [output]"
+        );
         std::process::exit(1);
     }
 
@@ -105,6 +111,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         effort: effort.clamp(1, 10),
         dry_run,
         skip_verify,
+        verbose,
         input: PathBuf::from(&positional[0]),
         output: positional.get(1).map(PathBuf::from),
     }
@@ -116,11 +123,18 @@ fn cmd_compress_main(args: &[String]) {
     if opts.input.is_dir() {
         cmd_compress_dir(&opts);
     } else {
-        let output = opts
+        let out_path = opts
             .output
             .unwrap_or_else(|| opts.input.with_extension("cnef"));
-        match compress_one(&opts.input, if opts.dry_run { None } else { Some(&output) }, opts.effort, opts.skip_verify) {
-            Ok(result) => print_compress_result(&result),
+        match compress_one(&opts.input, opts.effort, opts.skip_verify) {
+            Ok(result) => {
+                if !opts.dry_run {
+                    if let Some(ref data) = result.cnef_data {
+                        std::fs::write(&out_path, data).expect("write output");
+                    }
+                }
+                print_compress_result(&result, opts.verbose, opts.dry_run);
+            }
             Err(e) => {
                 eprintln!("{}: {e}", opts.input.display());
                 std::process::exit(1);
@@ -131,34 +145,42 @@ fn cmd_compress_main(args: &[String]) {
 
 struct CompressResult {
     input_name: String,
-    output_name: String,
     original_size: u64,
     cnef_size: u64,
+    cnef_data: Option<Vec<u8>>,
     segments: Vec<nef_compactor::cnef::SegmentStats>,
 }
 
-fn print_compress_result(r: &CompressResult) {
+fn print_compress_result(r: &CompressResult, verbose: bool, dry_run: bool) {
     let ratio = r.cnef_size as f64 / r.original_size as f64 * 100.0;
-    println!("{} → {} ({:.1}%)", r.input_name, r.output_name, ratio);
-    for seg in &r.segments {
-        let label = match seg.seg_type {
-            nef_compactor::cnef::SegmentType::Zstd => "zstd",
-            nef_compactor::cnef::SegmentType::RawPixelsJxl => "raw→jxl",
-            nef_compactor::cnef::SegmentType::JpegJxl => "jpeg→jxl",
-        };
-        let seg_ratio = if seg.original_size > 0 {
-            seg.compressed_size as f64 / seg.original_size as f64 * 100.0
-        } else {
-            0.0
-        };
-        println!(
-            "    {:<10} {:>10} → {:>10} ({:.1}%)",
-            label, seg.original_size, seg.compressed_size, seg_ratio,
-        );
+    let target = if dry_run { "(dry-run)" } else { "" };
+    println!("{} → {target}({:.1}%)", r.input_name, ratio);
+    if verbose {
+        for seg in &r.segments {
+            let label = match seg.seg_type {
+                nef_compactor::cnef::SegmentType::Zstd => "zstd",
+                nef_compactor::cnef::SegmentType::RawPixelsJxl => "raw→jxl",
+                nef_compactor::cnef::SegmentType::JpegJxl => "jpeg→jxl",
+            };
+            let seg_ratio = if seg.original_size > 0 {
+                seg.compressed_size as f64 / seg.original_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    {:<10} {:>10} → {:>10} ({:.1}%)",
+                label, seg.original_size, seg.compressed_size, seg_ratio,
+            );
+        }
     }
 }
 
-fn compress_one(input: &Path, output: Option<&Path>, effort: i64, skip_verify: bool) -> Result<CompressResult, String> {
+/// Compress a single NEF to memory. Does NOT write to disk — caller decides.
+fn compress_one(
+    input: &Path,
+    effort: i64,
+    skip_verify: bool,
+) -> Result<CompressResult, String> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut nef_file = std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
@@ -197,12 +219,18 @@ fn compress_one(input: &Path, output: Option<&Path>, effort: i64, skip_verify: b
         let mut reconstructed = Vec::new();
         nef_compactor::cnef::decompress(&mut cursor, &mut reconstructed)?;
 
-        nef_file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek: {e}"))?;
+        nef_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek: {e}"))?;
         let mut original = Vec::with_capacity(original_size as usize);
-        nef_file.read_to_end(&mut original).map_err(|e| format!("read original: {e}"))?;
+        nef_file
+            .read_to_end(&mut original)
+            .map_err(|e| format!("read original: {e}"))?;
 
         if original != reconstructed {
-            let first_diff = original.iter().zip(reconstructed.iter())
+            let first_diff = original
+                .iter()
+                .zip(reconstructed.iter())
                 .position(|(a, b)| a != b)
                 .unwrap_or(original.len().min(reconstructed.len()));
             return Err(format!(
@@ -212,22 +240,13 @@ fn compress_one(input: &Path, output: Option<&Path>, effort: i64, skip_verify: b
         }
     }
 
-    if let Some(out_path) = output {
-        std::fs::write(out_path, &cnef_buf).map_err(|e| format!("write output: {e}"))?;
-    }
-
     let input_name = input.file_name().unwrap().to_string_lossy().to_string();
-    let output_name = if let Some(p) = output {
-        p.file_name().unwrap().to_string_lossy().to_string()
-    } else {
-        "(dry-run)".to_string()
-    };
 
     Ok(CompressResult {
         input_name,
-        output_name,
         original_size,
         cnef_size,
+        cnef_data: Some(cnef_buf),
         segments: stats.segments,
     })
 }
@@ -257,108 +276,179 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         std::process::exit(1);
     }
 
-    // Build (input, output) pairs in order
-    let tasks: Vec<(PathBuf, Option<PathBuf>)> = files
+    let out_paths: Vec<Option<PathBuf>> = files
         .iter()
         .map(|f| {
-            let stem = f.file_stem().unwrap().to_string_lossy();
-            let out = if opts.dry_run {
+            if opts.dry_run {
                 None
             } else {
+                let stem = f.file_stem().unwrap().to_string_lossy();
                 Some(out_dir.join(format!("{stem}.cnef")))
-            };
-            (f.clone(), out)
+            }
         })
         .collect();
 
     let effort = opts.effort;
     let skip_verify = opts.skip_verify;
-    let results: Vec<Result<CompressResult, String>> = if opts.jobs <= 1 {
-        tasks
-            .iter()
-            .map(|(input, output)| compress_one(input, output.as_deref(), effort, skip_verify))
-            .collect()
-    } else {
-        parallel_compress(&tasks, opts.jobs, effort, skip_verify)
-    };
+    let verbose = opts.verbose;
+    let dry_run = opts.dry_run;
 
-    let mut compressed = 0u64;
-    let mut failed = 0u64;
-    let mut total_original = 0u64;
-    let mut total_cnef = 0u64;
+    // Shared state for in-order streaming output
+    let state = StreamState::new(files.len());
 
-    for (i, result) in results.into_iter().enumerate() {
-        match result {
-            Ok(r) => {
-                total_original += r.original_size;
-                total_cnef += r.cnef_size;
-                compressed += 1;
-                print_compress_result(&r);
-            }
-            Err(e) => {
-                let name = files[i].file_name().unwrap().to_string_lossy();
-                eprintln!("{name}: skipped ({e})");
-                failed += 1;
-            }
+    let n = files.len();
+
+    if opts.jobs <= 1 {
+        for i in 0..n {
+            let result = compress_one(&files[i], effort, skip_verify);
+            state.publish(i, result);
+            state.drain(&files, &out_paths, verbose, dry_run);
         }
-    }
-
-    let total_ratio = if total_original > 0 {
-        total_cnef as f64 / total_original as f64 * 100.0
     } else {
-        0.0
-    };
+        let next_idx = Mutex::new(0usize);
 
-    println!();
-    println!(
-        "Summary: {} compressed, {} skipped, {} total",
-        compressed,
-        failed,
-        files.len(),
-    );
-    if compressed > 0 {
-        println!(
-            "  total: {} → {} bytes ({:.1}%)",
-            total_original, total_cnef, total_ratio,
-        );
+        std::thread::scope(|scope| {
+            let drainer = scope.spawn(|| {
+                state.drain_blocking(n, &files, &out_paths, verbose, dry_run);
+            });
+
+            for _ in 0..opts.jobs {
+                scope.spawn(|| loop {
+                    let idx = {
+                        let mut next = next_idx.lock().unwrap();
+                        if *next >= n {
+                            return;
+                        }
+                        let i = *next;
+                        *next += 1;
+                        i
+                    };
+
+                    let result = compress_one(&files[idx], effort, skip_verify);
+                    state.publish(idx, result);
+                });
+            }
+
+            drainer.join().unwrap();
+        });
     }
+
+    state.print_summary(files.len());
 }
 
-fn parallel_compress(
-    tasks: &[(PathBuf, Option<PathBuf>)],
-    jobs: usize,
-    effort: i64,
-    skip_verify: bool,
-) -> Vec<Result<CompressResult, String>> {
-    let n = tasks.len();
-    let results: Vec<Mutex<Option<Result<CompressResult, String>>>> =
-        (0..n).map(|_| Mutex::new(None)).collect();
-    let next_idx = Mutex::new(0usize);
+struct StreamState {
+    inner: Mutex<StreamInner>,
+    cond: Condvar,
+}
 
-    std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            scope.spawn(|| loop {
-                let idx = {
-                    let mut next = next_idx.lock().unwrap();
-                    if *next >= n {
-                        return;
-                    }
-                    let i = *next;
-                    *next += 1;
-                    i
-                };
+struct StreamInner {
+    slots: Vec<Option<Result<CompressResult, String>>>,
+    next_print: usize,
+    compressed: u64,
+    failed: u64,
+    total_original: u64,
+    total_cnef: u64,
+}
 
-                let (input, output) = &tasks[idx];
-                let result = compress_one(input, output.as_deref(), effort, skip_verify);
-                *results[idx].lock().unwrap() = Some(result);
-            });
+impl StreamState {
+    fn new(n: usize) -> Self {
+        StreamState {
+            inner: Mutex::new(StreamInner {
+                slots: (0..n).map(|_| None).collect(),
+                next_print: 0,
+                compressed: 0,
+                failed: 0,
+                total_original: 0,
+                total_cnef: 0,
+            }),
+            cond: Condvar::new(),
         }
-    });
+    }
 
-    results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().unwrap())
-        .collect()
+    fn publish(&self, idx: usize, result: Result<CompressResult, String>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots[idx] = Some(result);
+        self.cond.notify_all();
+    }
+
+    fn drain(
+        &self,
+        files: &[PathBuf],
+        out_paths: &[Option<PathBuf>],
+        verbose: bool,
+        dry_run: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        while inner.next_print < inner.slots.len() {
+            let idx = inner.next_print;
+            let Some(result) = inner.slots[idx].take() else {
+                break;
+            };
+            inner.next_print += 1;
+
+            match result {
+                Ok(r) => {
+                    if !dry_run {
+                        if let (Some(data), Some(path)) = (&r.cnef_data, &out_paths[idx]) {
+                            if let Err(e) = std::fs::write(path, data) {
+                                eprintln!("{}: write failed ({e})", r.input_name);
+                                inner.failed += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    inner.compressed += 1;
+                    inner.total_original += r.original_size;
+                    inner.total_cnef += r.cnef_size;
+                    print_compress_result(&r, verbose, dry_run);
+                }
+                Err(e) => {
+                    let name = files[idx].file_name().unwrap().to_string_lossy();
+                    eprintln!("{name}: skipped ({e})");
+                    inner.failed += 1;
+                }
+            }
+        }
+    }
+
+    fn drain_blocking(
+        &self,
+        n: usize,
+        files: &[PathBuf],
+        out_paths: &[Option<PathBuf>],
+        verbose: bool,
+        dry_run: bool,
+    ) {
+        loop {
+            self.drain(files, out_paths, verbose, dry_run);
+            let inner = self.inner.lock().unwrap();
+            if inner.next_print >= n {
+                return;
+            }
+            let _unused = self.cond.wait(inner).unwrap();
+        }
+    }
+
+    fn print_summary(&self, total_files: usize) {
+        let inner = self.inner.lock().unwrap();
+        let total_ratio = if inner.total_original > 0 {
+            inner.total_cnef as f64 / inner.total_original as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        println!();
+        println!(
+            "Summary: {} compressed, {} skipped, {} total",
+            inner.compressed, inner.failed, total_files,
+        );
+        if inner.compressed > 0 {
+            println!(
+                "  total: {} → {} bytes ({:.1}%)",
+                inner.total_original, inner.total_cnef, total_ratio,
+            );
+        }
+    }
 }
 
 // ─── Decompress ──────────────────────────────────────────────────────────────
