@@ -1,0 +1,242 @@
+use std::io::{Read, Seek};
+
+use crate::tiff::*;
+
+#[derive(Debug, Clone)]
+pub struct NefChunks {
+    pub file_size: u64,
+    pub tiff_view: TiffView,
+    pub raw_strip: RawStrip,
+    pub jpegs: Vec<JpegChunk>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawStrip {
+    pub offset: u64,
+    pub length: u64,
+    pub width: u32,
+    pub height: u32,
+    pub bits_per_sample: u32,
+    pub compression: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct JpegChunk {
+    pub offset: u64,
+    pub length: u32,
+    pub width: u32,
+    pub height: u32,
+    pub label: JpegLabel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JpegLabel {
+    Thumbnail,
+    PreviewImage,
+    JpgFromRaw,
+}
+
+pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
+    let file_size = reader
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(|e| format!("seek to end: {e}"))?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("seek to start: {e}"))?;
+
+    let (main, ifd0_offset) = TiffView::parse_header(reader, 0)?;
+    let ifd0 = main.read_ifd(reader, ifd0_offset)?;
+
+    let mut jpegs = Vec::new();
+
+    // IFD0 thumbnail (160x120)
+    if let Some(jpeg) = jpeg_from_inline_pointers(&main, reader, &ifd0)? {
+        jpegs.push(JpegChunk {
+            offset: jpeg.offset,
+            length: jpeg.length,
+            width: jpeg.width,
+            height: jpeg.height,
+            label: JpegLabel::Thumbnail,
+        });
+    }
+
+    // SubIFDs — find the raw strip and JpgFromRaw
+    let mut raw_strip: Option<RawStrip> = None;
+    let mut best_jpeg: Option<JpegChunk> = None;
+
+    if let Some(subifds_entry) = main.find_entry(&ifd0, TAG_SUB_IFDS) {
+        let subifd_offsets = main.entry_long_array(reader, subifds_entry)?;
+        for offset in subifd_offsets {
+            let entries = match main.read_ifd(reader, offset) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let compression = main
+                .find_entry(&entries, TAG_COMPRESSION)
+                .and_then(|e| main.entry_scalar(e))
+                .unwrap_or(1);
+
+            let width = main
+                .find_entry(&entries, TAG_IMAGE_WIDTH)
+                .and_then(|e| main.entry_scalar(e))
+                .unwrap_or(0);
+            let height = main
+                .find_entry(&entries, TAG_IMAGE_LENGTH)
+                .and_then(|e| main.entry_scalar(e))
+                .unwrap_or(0);
+
+            if compression == COMPRESSION_NIKON_LOSSLESS || compression == 1 {
+                // Raw strip
+                let strip_offset = main
+                    .find_entry(&entries, TAG_STRIP_OFFSETS)
+                    .and_then(|e| main.entry_scalar(e))
+                    .unwrap_or(0) as u64;
+                let strip_length = main
+                    .find_entry(&entries, TAG_STRIP_BYTE_COUNTS)
+                    .and_then(|e| main.entry_scalar(e))
+                    .unwrap_or(0) as u64;
+                let bps = main
+                    .find_entry(&entries, TAG_BITS_PER_SAMPLE)
+                    .and_then(|e| main.entry_scalar(e))
+                    .unwrap_or(14);
+
+                if strip_length > 0 {
+                    let is_bigger = raw_strip
+                        .as_ref()
+                        .map_or(true, |r| width * height > r.width * r.height);
+                    if is_bigger {
+                        raw_strip = Some(RawStrip {
+                            offset: strip_offset,
+                            length: strip_length,
+                            width,
+                            height,
+                            bits_per_sample: bps,
+                            compression,
+                        });
+                    }
+                }
+            } else if compression == COMPRESSION_JPEG_OLD_STYLE || compression == COMPRESSION_JPEG
+            {
+                if let Some(jpeg) = jpeg_from_inline_pointers(&main, reader, &entries)? {
+                    let bigger = match &best_jpeg {
+                        Some(existing)
+                            if existing.width * existing.height >= jpeg.width * jpeg.height =>
+                        {
+                            false
+                        }
+                        _ => true,
+                    };
+                    if bigger {
+                        best_jpeg = Some(JpegChunk {
+                            offset: jpeg.offset,
+                            length: jpeg.length,
+                            width: jpeg.width,
+                            height: jpeg.height,
+                            label: JpegLabel::JpgFromRaw,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(j) = best_jpeg {
+        jpegs.push(j);
+    }
+
+    // MakerNote → PreviewIFD → PreviewImage (640x424)
+    if let Some(exif_entry) = main.find_entry(&ifd0, TAG_EXIF_IFD) {
+        let exif_offset = main
+            .entry_scalar(exif_entry)
+            .ok_or("ExifIFD pointer not scalar")?;
+        if let Some(preview) = find_preview_image(&main, reader, exif_offset)? {
+            jpegs.push(JpegChunk {
+                offset: preview.offset,
+                length: preview.length,
+                width: preview.width,
+                height: preview.height,
+                label: JpegLabel::PreviewImage,
+            });
+        }
+    }
+
+    let raw_strip = raw_strip.ok_or("NEF: no raw data strip found")?;
+
+    Ok(NefChunks {
+        file_size,
+        tiff_view: main,
+        raw_strip,
+        jpegs,
+    })
+}
+
+fn jpeg_from_inline_pointers<R: Read + Seek>(
+    view: &TiffView,
+    reader: &mut R,
+    entries: &[RawEntry],
+) -> Result<Option<EmbeddedJpeg>, String> {
+    let offset = view
+        .find_entry(entries, TAG_JPEG_INTERCHANGE_FORMAT)
+        .and_then(|e| view.entry_scalar(e));
+    let length = view
+        .find_entry(entries, TAG_JPEG_INTERCHANGE_FORMAT_LENGTH)
+        .and_then(|e| view.entry_scalar(e));
+    let (Some(offset), Some(length)) = (offset, length) else {
+        return Ok(None);
+    };
+    if length == 0 {
+        return Ok(None);
+    }
+    let abs_offset = view.abs_from_ifd_offset(offset) as u64;
+    let (width, height) = read_jpeg_sof(reader, abs_offset as usize, length as usize)?;
+    Ok(Some(EmbeddedJpeg {
+        offset: abs_offset,
+        length,
+        width,
+        height,
+    }))
+}
+
+fn find_preview_image<R: Read + Seek>(
+    main: &TiffView,
+    reader: &mut R,
+    exif_ifd_offset: u32,
+) -> Result<Option<EmbeddedJpeg>, String> {
+    let exif_ifd = main.read_ifd(reader, exif_ifd_offset)?;
+    let makernote_entry = match main.find_entry(&exif_ifd, TAG_MAKERNOTE) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if makernote_entry.count <= 4 {
+        return Ok(None);
+    }
+    let makernote_rel = main.decode_u32(&makernote_entry.value_bytes);
+    let makernote_abs = main.abs_from_ifd_offset(makernote_rel);
+
+    reader
+        .seek(std::io::SeekFrom::Start(makernote_abs as u64))
+        .map_err(|e| format!("MakerNote seek: {e}"))?;
+    let mut header = [0u8; 10];
+    if reader.read_exact(&mut header).is_err() {
+        return Ok(None);
+    }
+    if &header[..6] != b"Nikon\0" {
+        return Ok(None);
+    }
+
+    let embedded_base = makernote_abs + 10;
+    let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
+    let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
+
+    let preview_ifd_entry = match embedded.find_entry(&nikon_ifd, TAG_NIKON_PREVIEW_IFD) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let preview_ifd_offset = embedded
+        .entry_scalar(preview_ifd_entry)
+        .ok_or("Nikon PreviewIFD pointer not scalar")?;
+
+    let preview_ifd = embedded.read_ifd(reader, preview_ifd_offset)?;
+    jpeg_from_inline_pointers(&embedded, reader, &preview_ifd)
+}
