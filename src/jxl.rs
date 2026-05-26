@@ -2,20 +2,41 @@ use jpegxl_rs::decode::Data;
 use jpegxl_rs::decoder_builder;
 use jpegxl_rs::encoder_builder;
 
-/// Encode 16-bit grayscale pixels as lossless JPEG XL with the true bit depth.
+/// Encode Bayer mosaic pixels as lossless JPEG XL by deinterleaving
+/// into 4 half-resolution channels (the 2x2 Bayer phases).
+/// Width and height must be even.
 pub fn encode_pixels(
     pixels: &[u16],
     width: u32,
     height: u32,
     bits_per_sample: u32,
 ) -> Result<Vec<u8>, String> {
-    unsafe { encode_pixels_ffi(pixels, width, height, bits_per_sample) }
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(format!("dimensions must be even for Bayer deinterleave: {width}x{height}"));
+    }
+    let half_w = width / 2;
+    let half_h = height / 2;
+
+    let interleaved = bayer_deinterleave(pixels, width as usize, height as usize);
+    let jxl = unsafe { encode_4ch_ffi(&interleaved, half_w, half_h, bits_per_sample) }?;
+    Ok(jxl)
 }
 
-/// Decode lossless JPEG XL back to 16-bit grayscale pixels, preserving
-/// the original bit depth values (no rescaling).
-pub fn decode_pixels(jxl_data: &[u8]) -> Result<(Vec<u16>, u32, u32), String> {
-    unsafe { decode_pixels_ffi(jxl_data) }
+/// Decode lossless JPEG XL back to Bayer mosaic pixels by reinterleaving
+/// the 4 channels.
+pub fn decode_pixels(
+    jxl_data: &[u8],
+    full_width: u32,
+    full_height: u32,
+) -> Result<Vec<u16>, String> {
+    let (interleaved, half_w, half_h) = unsafe { decode_4ch_ffi(jxl_data) }?;
+    if half_w * 2 != full_width || half_h * 2 != full_height {
+        return Err(format!(
+            "JXL dimensions {}x{} don't match expected {}x{}",
+            half_w * 2, half_h * 2, full_width, full_height,
+        ));
+    }
+    Ok(bayer_reinterleave(&interleaved, full_width as usize, full_height as usize))
 }
 
 /// Losslessly recompress JPEG bytes into JPEG XL.
@@ -46,9 +67,49 @@ pub fn decode_jpeg(jxl_data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-// ─── FFI pixel encoder ───────────────────────────────────────────────────────
+// ─── Bayer deinterleave / reinterleave ───────────────────────────────────────
 
-unsafe fn encode_pixels_ffi(
+/// Deinterleave Bayer mosaic into 4-channel interleaved buffer (ABCD ABCD ...).
+/// Channel 0: (even_row, even_col), Channel 1: (even_row, odd_col),
+/// Channel 2: (odd_row, even_col),  Channel 3: (odd_row, odd_col).
+fn bayer_deinterleave(mosaic: &[u16], width: usize, height: usize) -> Vec<u16> {
+    let half_w = width / 2;
+    let half_h = height / 2;
+    let mut out = vec![0u16; half_w * half_h * 4];
+
+    for row in 0..half_h {
+        for col in 0..half_w {
+            let dst = (row * half_w + col) * 4;
+            out[dst] = mosaic[(row * 2) * width + (col * 2)];
+            out[dst + 1] = mosaic[(row * 2) * width + (col * 2 + 1)];
+            out[dst + 2] = mosaic[(row * 2 + 1) * width + (col * 2)];
+            out[dst + 3] = mosaic[(row * 2 + 1) * width + (col * 2 + 1)];
+        }
+    }
+    out
+}
+
+/// Reinterleave 4-channel buffer back into Bayer mosaic.
+fn bayer_reinterleave(interleaved: &[u16], width: usize, height: usize) -> Vec<u16> {
+    let half_w = width / 2;
+    let half_h = height / 2;
+    let mut mosaic = vec![0u16; width * height];
+
+    for row in 0..half_h {
+        for col in 0..half_w {
+            let src = (row * half_w + col) * 4;
+            mosaic[(row * 2) * width + (col * 2)] = interleaved[src];
+            mosaic[(row * 2) * width + (col * 2 + 1)] = interleaved[src + 1];
+            mosaic[(row * 2 + 1) * width + (col * 2)] = interleaved[src + 2];
+            mosaic[(row * 2 + 1) * width + (col * 2 + 1)] = interleaved[src + 3];
+        }
+    }
+    mosaic
+}
+
+// ─── FFI 4-channel encoder ───────────────────────────────────────────────────
+
+unsafe fn encode_4ch_ffi(
     pixels: &[u16],
     width: u32,
     height: u32,
@@ -56,6 +117,7 @@ unsafe fn encode_pixels_ffi(
 ) -> Result<Vec<u8>, String> {
     use jpegxl_sys::common::types::*;
     use jpegxl_sys::encoder::encode::*;
+    use jpegxl_sys::metadata::codestream_header::JxlExtraChannelType;
     use std::ffi::c_void;
     use std::mem::MaybeUninit;
     use std::ptr;
@@ -75,16 +137,28 @@ unsafe fn encode_pixels_ffi(
     info.ysize = height;
     info.bits_per_sample = bits_per_sample;
     info.exponent_bits_per_sample = 0;
-    info.num_color_channels = 1;
-    info.num_extra_channels = 0;
-    info.alpha_bits = 0;
+    info.num_color_channels = 3;
+    info.num_extra_channels = 1;
+    info.alpha_bits = bits_per_sample;
+    info.alpha_exponent_bits = 0;
     info.uses_original_profile = true.into();
 
     enc_check(unsafe { JxlEncoderSetBasicInfo(enc, &info) }, "SetBasicInfo")?;
 
+    let mut ec_info = unsafe {
+        let mut ec = MaybeUninit::uninit();
+        JxlEncoderInitExtraChannelInfo(JxlExtraChannelType::Alpha, ec.as_mut_ptr());
+        ec.assume_init()
+    };
+    ec_info.bits_per_sample = bits_per_sample;
+    enc_check(
+        unsafe { JxlEncoderSetExtraChannelInfo(enc, 0, &ec_info) },
+        "SetExtraChannelInfo",
+    )?;
+
     let mut color = unsafe {
         let mut c = MaybeUninit::uninit();
-        JxlColorEncodingSetToSRGB(c.as_mut_ptr(), true);
+        JxlColorEncodingSetToSRGB(c.as_mut_ptr(), false);
         c.assume_init()
     };
     let _ = &mut color;
@@ -108,7 +182,6 @@ unsafe fn encode_pixels_ffi(
         "SetEffort",
     )?;
 
-    // Input values are in 0..2^bps, not rescaled to 0..65535
     let bit_depth = JxlBitDepth {
         r#type: JxlBitDepthType::FromCodestream,
         bits_per_sample,
@@ -119,8 +192,9 @@ unsafe fn encode_pixels_ffi(
         "SetFrameBitDepth",
     )?;
 
+    // 4-channel interleaved: 3 color + 1 alpha
     let pixel_format = JxlPixelFormat {
-        num_channels: 1,
+        num_channels: 4,
         data_type: JxlDataType::Uint16,
         endianness: JxlEndianness::Native,
         align: 0,
@@ -171,9 +245,9 @@ fn drain_encoder(enc: *mut jpegxl_sys::encoder::encode::JxlEncoder) -> Result<Ve
     }
 }
 
-// ─── FFI pixel decoder ───────────────────────────────────────────────────────
+// ─── FFI 4-channel decoder ───────────────────────────────────────────────────
 
-unsafe fn decode_pixels_ffi(jxl_data: &[u8]) -> Result<(Vec<u16>, u32, u32), String> {
+unsafe fn decode_4ch_ffi(jxl_data: &[u8]) -> Result<(Vec<u16>, u32, u32), String> {
     use jpegxl_sys::common::types::*;
     use jpegxl_sys::decode::*;
     use jpegxl_sys::metadata::codestream_header::JxlBasicInfo;
@@ -223,14 +297,16 @@ unsafe fn decode_pixels_ffi(jxl_data: &[u8]) -> Result<(Vec<u16>, u32, u32), Str
                 height = info.ysize;
             }
             JxlDecoderStatus::NeedImageOutBuffer => {
+                // 4 channels interleaved
                 let pixel_format = JxlPixelFormat {
-                    num_channels: 1,
+                    num_channels: 4,
                     data_type: JxlDataType::Uint16,
                     endianness: JxlEndianness::Native,
                     align: 0,
                 };
-                let buf_size = (width as usize) * (height as usize) * 2;
-                pixels = vec![0u16; (width as usize) * (height as usize)];
+                let n_pixels = (width as usize) * (height as usize) * 4;
+                let buf_size = n_pixels * 2;
+                pixels = vec![0u16; n_pixels];
                 dec_check(
                     unsafe {
                         JxlDecoderSetImageOutBuffer(

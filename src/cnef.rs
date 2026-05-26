@@ -319,7 +319,7 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
             }
             SegmentType::RawPixelsJxl => {
                 let m = raw_meta.unwrap();
-                let (pixels, _, _) = jxl::decode_pixels(&payload)?;
+                let pixels = jxl::decode_pixels(&payload, m.width, m.height)?;
 
                 let nikon_compressed = nikon_lossless::encode(
                     &pixels,
