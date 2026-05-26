@@ -79,6 +79,7 @@ pub fn compress<R: Read + Seek, W: Write>(
     nef: &mut R,
     chunks: &NefChunks,
     lossless_meta: Option<&NikonLosslessMeta>,
+    effort: i64,
     out: &mut W,
 ) -> Result<CompressionStats, String> {
     let mut regions: Vec<(u64, u64, RegionKind)> = Vec::new();
@@ -142,6 +143,7 @@ pub fn compress<R: Read + Seek, W: Write>(
                     chunks.raw_strip.width,
                     chunks.raw_strip.height,
                     bps,
+                    effort,
                 )?;
 
                 segments.push(Segment {

@@ -37,7 +37,8 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   [-j N] [--dry-run] <input.NEF | dir> [output]");
+    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] <input.NEF | dir> [output]");
+    eprintln!("             effort: 1 (fastest) to 10 (slowest), default 7");
     eprintln!("  decompress <input.cnef> [output.NEF]");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
@@ -47,33 +48,41 @@ fn usage() -> ! {
 
 struct CompressOpts {
     jobs: usize,
+    effort: i64,
     dry_run: bool,
     input: PathBuf,
     output: Option<PathBuf>,
 }
 
+fn parse_num_after_flag(args: &[String], i: &mut usize, flag: &str) -> Option<i64> {
+    *i += 1;
+    args.get(*i).and_then(|s| s.parse().ok()).or_else(|| {
+        eprintln!("{flag} requires a number");
+        std::process::exit(1);
+    })
+}
+
 fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut jobs = 1usize;
+    let mut effort = 7i64;
     let mut dry_run = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-j" => {
-                i += 1;
-                jobs = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("-j requires a number");
-                        std::process::exit(1);
-                    });
-            }
+            "-j" => jobs = parse_num_after_flag(args, &mut i, "-j").unwrap() as usize,
+            "-e" => effort = parse_num_after_flag(args, &mut i, "-e").unwrap(),
             "--dry-run" => dry_run = true,
             _ if args[i].starts_with("-j") => {
                 jobs = args[i][2..].parse().unwrap_or_else(|_| {
                     eprintln!("-j requires a number");
+                    std::process::exit(1);
+                });
+            }
+            _ if args[i].starts_with("-e") => {
+                effort = args[i][2..].parse().unwrap_or_else(|_| {
+                    eprintln!("-e requires a number");
                     std::process::exit(1);
                 });
             }
@@ -83,12 +92,13 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     }
 
     if positional.is_empty() {
-        eprintln!("usage: nef-compactor compress [-j N] [--dry-run] <input> [output]");
+        eprintln!("usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] <input> [output]");
         std::process::exit(1);
     }
 
     CompressOpts {
         jobs,
+        effort: effort.clamp(1, 10),
         dry_run,
         input: PathBuf::from(&positional[0]),
         output: positional.get(1).map(PathBuf::from),
@@ -104,7 +114,7 @@ fn cmd_compress_main(args: &[String]) {
         let output = opts
             .output
             .unwrap_or_else(|| opts.input.with_extension("cnef"));
-        match compress_one(&opts.input, if opts.dry_run { None } else { Some(&output) }) {
+        match compress_one(&opts.input, if opts.dry_run { None } else { Some(&output) }, opts.effort) {
             Ok(result) => print_compress_result(&result),
             Err(e) => {
                 eprintln!("{}: {e}", opts.input.display());
@@ -145,7 +155,7 @@ fn print_compress_result(r: &CompressResult) {
 
 /// Compress a single NEF. If `output` is None, compress to a temporary
 /// buffer and discard (dry-run mode).
-fn compress_one(input: &Path, output: Option<&Path>) -> Result<CompressResult, String> {
+fn compress_one(input: &Path, output: Option<&Path>, effort: i64) -> Result<CompressResult, String> {
     let mut nef_file = std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
     let chunks = nef_compactor::nef::scan_nef(&mut nef_file)?;
 
@@ -174,6 +184,7 @@ fn compress_one(input: &Path, output: Option<&Path>) -> Result<CompressResult, S
             &mut nef_file,
             &chunks,
             lossless_meta.as_ref(),
+            effort,
             &mut out_file,
         )?;
         let cnef_size = std::fs::metadata(out_path)
@@ -186,6 +197,7 @@ fn compress_one(input: &Path, output: Option<&Path>) -> Result<CompressResult, S
             &mut nef_file,
             &chunks,
             lossless_meta.as_ref(),
+            effort,
             &mut buf,
         )?;
         let cnef_size = buf.len() as u64;
@@ -247,14 +259,14 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         })
         .collect();
 
-    // Process in parallel, collecting results in order
+    let effort = opts.effort;
     let results: Vec<Result<CompressResult, String>> = if opts.jobs <= 1 {
         tasks
             .iter()
-            .map(|(input, output)| compress_one(input, output.as_deref()))
+            .map(|(input, output)| compress_one(input, output.as_deref(), effort))
             .collect()
     } else {
-        parallel_compress(&tasks, opts.jobs)
+        parallel_compress(&tasks, opts.jobs, effort)
     };
 
     let mut compressed = 0u64;
@@ -302,6 +314,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
 fn parallel_compress(
     tasks: &[(PathBuf, Option<PathBuf>)],
     jobs: usize,
+    effort: i64,
 ) -> Vec<Result<CompressResult, String>> {
     let n = tasks.len();
     let results: Vec<Mutex<Option<Result<CompressResult, String>>>> =
@@ -322,7 +335,7 @@ fn parallel_compress(
                 };
 
                 let (input, output) = &tasks[idx];
-                let result = compress_one(input, output.as_deref());
+                let result = compress_one(input, output.as_deref(), effort);
                 *results[idx].lock().unwrap() = Some(result);
             });
         }

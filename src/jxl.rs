@@ -10,6 +10,7 @@ pub fn encode_pixels(
     width: u32,
     height: u32,
     bits_per_sample: u32,
+    effort: i64,
 ) -> Result<Vec<u8>, String> {
     if width % 2 != 0 || height % 2 != 0 {
         return Err(format!("dimensions must be even for Bayer deinterleave: {width}x{height}"));
@@ -18,7 +19,7 @@ pub fn encode_pixels(
     let half_h = height / 2;
 
     let interleaved = bayer_deinterleave(pixels, width as usize, height as usize);
-    let jxl = unsafe { encode_4ch_ffi(&interleaved, half_w, half_h, bits_per_sample) }?;
+    let jxl = unsafe { encode_4ch_ffi(&interleaved, half_w, half_h, bits_per_sample, effort) }?;
     Ok(jxl)
 }
 
@@ -118,6 +119,7 @@ unsafe fn encode_4ch_ffi(
     width: u32,
     height: u32,
     bits_per_sample: u32,
+    effort: i64,
 ) -> Result<Vec<u8>, String> {
     use jpegxl_sys::common::types::*;
     use jpegxl_sys::encoder::encode::*;
@@ -181,7 +183,7 @@ unsafe fn encode_4ch_ffi(
     )?;
     enc_check(
         unsafe {
-            JxlEncoderFrameSettingsSetOption(opts, JxlEncoderFrameSettingId::Effort, 7)
+            JxlEncoderFrameSettingsSetOption(opts, JxlEncoderFrameSettingId::Effort, effort)
         },
         "SetEffort",
     )?;
