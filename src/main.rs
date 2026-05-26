@@ -38,7 +38,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] <input | dir> [output]");
-    eprintln!("             effort: 1 (fastest) to 10 (slowest), default 7");
+    eprintln!("             effort: 1 (fastest) to 10 (slowest), default 3");
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
     eprintln!("  decompress <input.cnef> [output.NEF]");
     eprintln!("  info       <input.NEF>");
@@ -66,7 +66,7 @@ fn parse_num_after_flag(args: &[String], i: &mut usize, flag: &str) -> Option<i6
 
 fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut jobs = 1usize;
-    let mut effort = 7i64;
+    let mut effort = 3i64;
     let mut dry_run = false;
     let mut skip_verify = false;
     let mut positional = Vec::new();
