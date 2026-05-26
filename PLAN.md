@@ -42,32 +42,20 @@ A NEF file is a TIFF container with several large binary chunks:
 ### Done
 
 - **TIFF/IFD parser** (`src/tiff.rs`): walks NEF TIFF structure including nested MakerNote embedded TIFF. Adapted from nefrite's `index.rs`.
-- **NEF scanner** (`src/nef.rs`): locates all chunks (raw strip, JpgFromRaw, PreviewImage, Thumbnail) with their file offsets and dimensions.
+- **NEF scanner** (`src/nef.rs`): locates all chunks (raw strip, JpgFromRaw, PreviewImage, Thumbnail) with their file offsets and dimensions. Also reads Nikon lossless compression metadata (Huffman table index, initial predictors, split row) from the MakerNote.
 - **Nikon lossless codec** (`src/nikon_lossless.rs`): both decoder and encoder. Uses the 6 predefined Huffman table sets from rawspeed/rawloader. Handles the two-channel interleaved prediction scheme (even/odd Bayer columns), row-start predictor reset, and split-row table switching.
 - **Roundtrip test** (`src/bin/roundtrip_test.rs`): reads a NEF, decodes the raw strip, re-encodes, asserts byte-for-byte equality. Tested on 3 legacy NEF files from Z50 II — all pass bit-perfect.
-
-### Next: CNEF container format
-
-- Define the binary container format (magic, chunk table, compressed payloads)
-- Implement CNEF writer (NEF → CNEF compression)
-- Implement CNEF reader (CNEF → NEF decompression)
+- **CNEF container format** (`src/cnef.rs`): binary container that splits the NEF into segments at chunk boundaries, compresses each independently, and reconstructs the original NEF byte-for-byte on decompression. Segments are ordered by file offset — decompression concatenates them without TIFF offset patching.
+- **CLI** (`src/main.rs`): `compress`, `decompress`, and `info` commands.
+- **Full NEF → CNEF → NEF roundtrip verified** on all 3 test files with `diff`. Currently uses zstd for all segments (including raw pixels), so CNEF files are *larger* than originals — JXL integration is the next step.
 
 ### Next: JPEG XL integration
 
+This is the critical step that makes compression actually *compress*.
+
 - Add `jxl-oxide` or `libjxl` dependency for JPEG XL encoding/decoding
-- Raw strip: decode Nikon lossless → 14-bit Bayer pixels → JXL lossless encode
-- JPEG thumbnails: JXL JPEG recompression (lossless transcode, ~20% savings, original JPEG reconstructible bit-for-bit)
-
-### Next: NEF reconstruction
-
-- Reassemble the full NEF file from decompressed chunks
-- Patch TIFF IFD offset fields so all pointers are valid in the output
-- Byte-for-byte verification against original NEF
-
-### Next: zstd for metadata
-
-- Compress the TIFF skeleton (chunk X) with zstd
-- Expected savings small in absolute terms but free compression
+- **Raw strip**: decode Nikon lossless → 14-bit Bayer pixels → JXL lossless encode. New segment type in CNEF. Expected to beat Nikon's 2007 Huffman by a significant margin.
+- **JPEG thumbnails**: JXL JPEG recompression (lossless transcode, ~20% savings, original JPEG reconstructible bit-for-bit). New segment type in CNEF.
 
 ### Future
 

@@ -1,163 +1,9 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use nef_compactor::nef::{scan_nef, NefChunks};
+use nef_compactor::nef::{read_nikon_lossless_meta, scan_nef};
 use nef_compactor::nikon_lossless;
-use nef_compactor::tiff::*;
-
-fn read_nef_compression_metadata<R: Read + Seek>(
-    reader: &mut R,
-    chunks: &NefChunks,
-) -> Result<CompressionMeta, String> {
-    let main = &chunks.tiff_view;
-    let (_, ifd0_offset) = TiffView::parse_header(reader, 0)?;
-    let ifd0 = main.read_ifd(reader, ifd0_offset)?;
-
-    let subifds_entry = main
-        .find_entry(&ifd0, TAG_SUB_IFDS)
-        .ok_or("no SubIFDs")?;
-    let subifd_offsets = main.entry_long_array(reader, subifds_entry)?;
-
-    for offset in subifd_offsets {
-        let entries = match main.read_ifd(reader, offset) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let compression = main
-            .find_entry(&entries, TAG_COMPRESSION)
-            .and_then(|e| main.entry_scalar(e))
-            .unwrap_or(1);
-
-        if compression != COMPRESSION_NIKON_LOSSLESS {
-            continue;
-        }
-
-        let width = main
-            .find_entry(&entries, TAG_IMAGE_WIDTH)
-            .and_then(|e| main.entry_scalar(e))
-            .unwrap_or(0);
-        let height = main
-            .find_entry(&entries, TAG_IMAGE_LENGTH)
-            .and_then(|e| main.entry_scalar(e))
-            .unwrap_or(0);
-
-        if width != chunks.raw_strip.width || height != chunks.raw_strip.height {
-            continue;
-        }
-
-        // Find the metadata tag (NefMeta2 = 0x0096, NefMeta1 = 0x008C)
-        // These live in the ExifIFD's MakerNote's Nikon IFD.
-        let exif_entry = main.find_entry(&ifd0, TAG_EXIF_IFD).ok_or("no ExifIFD")?;
-        let exif_offset = main.entry_scalar(exif_entry).ok_or("ExifIFD not scalar")?;
-        let exif_ifd = main.read_ifd(reader, exif_offset)?;
-
-        let makernote_entry = main
-            .find_entry(&exif_ifd, TAG_MAKERNOTE)
-            .ok_or("no MakerNote")?;
-        let makernote_rel = main.decode_u32(&makernote_entry.value_bytes);
-        let makernote_abs = main.abs_from_ifd_offset(makernote_rel);
-
-        reader
-            .seek(SeekFrom::Start(makernote_abs as u64))
-            .map_err(|e| format!("seek MakerNote: {e}"))?;
-        let mut header = [0u8; 10];
-        reader
-            .read_exact(&mut header)
-            .map_err(|e| format!("read MakerNote header: {e}"))?;
-        if &header[..6] != b"Nikon\0" {
-            return Err("not a Nikon MakerNote".into());
-        }
-
-        let embedded_base = makernote_abs + 10;
-        let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
-        let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
-
-        // NefMeta2 (0x0096) or NefMeta1 (0x008C)
-        let meta_entry = embedded
-            .find_entry(&nikon_ifd, 0x0096)
-            .or_else(|| embedded.find_entry(&nikon_ifd, 0x008C))
-            .ok_or("no NefMeta tag")?;
-
-        let meta_offset = if meta_entry.count > 4 {
-            embedded.abs_from_ifd_offset(embedded.decode_u32(&meta_entry.value_bytes))
-        } else {
-            return Err("NefMeta too small".into());
-        };
-        let meta_len = meta_entry.count as usize;
-        let meta_bytes = main.read_bytes(reader, meta_offset as u64, meta_len)?;
-
-        let bps = chunks.raw_strip.bits_per_sample;
-        return parse_nikon_meta(&meta_bytes, &embedded, bps);
-    }
-
-    Err("no Nikon lossless compressed SubIFD found".into())
-}
-
-struct CompressionMeta {
-    huff_select: usize,
-    initial_predictors: [[i32; 2]; 2],
-    split_row: usize,
-}
-
-fn parse_nikon_meta(
-    meta: &[u8],
-    embedded: &TiffView,
-    bps: u32,
-) -> Result<CompressionMeta, String> {
-    if meta.len() < 10 {
-        return Err("NefMeta too short".into());
-    }
-
-    let v0 = meta[0];
-    let v1 = meta[1];
-
-    let mut pos = 2usize;
-    if v0 == 73 || v1 == 88 {
-        pos += 2110;
-    }
-
-    let mut huff_select: usize = 0;
-    if v0 == 70 {
-        huff_select = 2;
-    }
-    if bps == 14 {
-        huff_select += 3;
-    }
-
-    if pos + 8 > meta.len() {
-        return Err("NefMeta: predictor data truncated".into());
-    }
-
-    let read_u16 = |offset: usize| -> u16 { embedded.decode_u16(&meta[offset..offset + 2]) };
-
-    // Read order matches rawspeed: pUp[0][0], pUp[1][0], pUp[0][1], pUp[1][1]
-    // pUp[row&1][col&1] — first index is row parity, second is column parity
-    let val0 = read_u16(pos) as i32;
-    let val1 = read_u16(pos + 2) as i32;
-    let val2 = read_u16(pos + 4) as i32;
-    let val3 = read_u16(pos + 6) as i32;
-    pos += 8;
-
-    let mut split_row = 0usize;
-
-    if pos + 2 <= meta.len() {
-        let csize = read_u16(pos) as usize;
-
-        if v0 == 68 && (v1 == 32 || v1 == 64) && csize > 1 {
-            if 562 + 2 <= meta.len() {
-                split_row = read_u16(562) as usize;
-            }
-        }
-    }
-
-    Ok(CompressionMeta {
-        huff_select,
-        // pUp[0] = [val0, val2], pUp[1] = [val1, val3]
-        initial_predictors: [[val0, val2], [val1, val3]],
-        split_row,
-    })
-}
+use nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS;
 
 fn test_roundtrip(path: &Path) -> Result<(), String> {
     println!("Testing: {}", path.display());
@@ -183,13 +29,12 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
         chunks.raw_strip.offset,
     );
 
-    let meta = read_nef_compression_metadata(&mut file, &chunks)?;
+    let meta = read_nikon_lossless_meta(&mut file, &chunks)?;
     println!(
         "  huff_select={}, split_row={}, preds={:?}",
         meta.huff_select, meta.split_row, meta.initial_predictors,
     );
 
-    // Read the compressed raw strip
     file.seek(SeekFrom::Start(chunks.raw_strip.offset))
         .map_err(|e| format!("seek raw: {e}"))?;
     let mut compressed = vec![0u8; chunks.raw_strip.length as usize];
@@ -200,7 +45,6 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
     let height = chunks.raw_strip.height as usize;
     let bps = chunks.raw_strip.bits_per_sample;
 
-    // Decode
     let pixels = nikon_lossless::decode(
         &compressed,
         width,
@@ -212,7 +56,6 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
     )?;
     println!("  decoded {} pixels", pixels.len());
 
-    // Re-encode
     let recompressed = nikon_lossless::encode(
         &pixels,
         width,
@@ -228,7 +71,6 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
         compressed.len()
     );
 
-    // Compare
     let match_len = compressed.len().min(recompressed.len());
     let mut first_diff = None;
     for i in 0..match_len {
@@ -258,7 +100,6 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
     }
 
     if compressed.len() != recompressed.len() {
-        // Check if the difference is just trailing zeros (padding)
         let longer = if compressed.len() > recompressed.len() {
             &compressed[match_len..]
         } else {

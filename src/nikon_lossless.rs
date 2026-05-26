@@ -152,6 +152,7 @@ impl<'a> BitReader<'a> {
         val
     }
 
+    #[allow(dead_code)]
     fn total_bits_consumed(&self) -> usize {
         self.byte_pos * 8 - self.bits_left as usize
     }

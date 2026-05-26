@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::tiff::*;
 
@@ -8,6 +8,13 @@ pub struct NefChunks {
     pub tiff_view: TiffView,
     pub raw_strip: RawStrip,
     pub jpegs: Vec<JpegChunk>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NikonLosslessMeta {
+    pub huff_select: usize,
+    pub initial_predictors: [[i32; 2]; 2],
+    pub split_row: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +203,112 @@ fn jpeg_from_inline_pointers<R: Read + Seek>(
         width,
         height,
     }))
+}
+
+pub fn read_nikon_lossless_meta<R: Read + Seek>(
+    reader: &mut R,
+    chunks: &NefChunks,
+) -> Result<NikonLosslessMeta, String> {
+    let main = &chunks.tiff_view;
+    let (_, ifd0_offset) = TiffView::parse_header(reader, 0)?;
+    let ifd0 = main.read_ifd(reader, ifd0_offset)?;
+
+    let exif_entry = main.find_entry(&ifd0, TAG_EXIF_IFD).ok_or("no ExifIFD")?;
+    let exif_offset = main.entry_scalar(exif_entry).ok_or("ExifIFD not scalar")?;
+    let exif_ifd = main.read_ifd(reader, exif_offset)?;
+
+    let makernote_entry = main
+        .find_entry(&exif_ifd, TAG_MAKERNOTE)
+        .ok_or("no MakerNote")?;
+    let makernote_rel = main.decode_u32(&makernote_entry.value_bytes);
+    let makernote_abs = main.abs_from_ifd_offset(makernote_rel);
+
+    reader
+        .seek(SeekFrom::Start(makernote_abs as u64))
+        .map_err(|e| format!("seek MakerNote: {e}"))?;
+    let mut header = [0u8; 10];
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| format!("read MakerNote header: {e}"))?;
+    if &header[..6] != b"Nikon\0" {
+        return Err("not a Nikon MakerNote".into());
+    }
+
+    let embedded_base = makernote_abs + 10;
+    let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
+    let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
+
+    // NefMeta2 (0x0096) or NefMeta1 (0x008C)
+    let meta_entry = embedded
+        .find_entry(&nikon_ifd, 0x0096)
+        .or_else(|| embedded.find_entry(&nikon_ifd, 0x008C))
+        .ok_or("no NefMeta tag")?;
+
+    let meta_offset = if meta_entry.count > 4 {
+        embedded.abs_from_ifd_offset(embedded.decode_u32(&meta_entry.value_bytes))
+    } else {
+        return Err("NefMeta too small".into());
+    };
+    let meta_len = meta_entry.count as usize;
+    let meta_bytes = main.read_bytes(reader, meta_offset as u64, meta_len)?;
+
+    parse_nikon_meta(&meta_bytes, &embedded, chunks.raw_strip.bits_per_sample)
+}
+
+fn parse_nikon_meta(
+    meta: &[u8],
+    embedded: &TiffView,
+    bps: u32,
+) -> Result<NikonLosslessMeta, String> {
+    if meta.len() < 10 {
+        return Err("NefMeta too short".into());
+    }
+
+    let v0 = meta[0];
+    let v1 = meta[1];
+
+    let mut pos = 2usize;
+    if v0 == 73 || v1 == 88 {
+        pos += 2110;
+    }
+
+    let mut huff_select: usize = 0;
+    if v0 == 70 {
+        huff_select = 2;
+    }
+    if bps == 14 {
+        huff_select += 3;
+    }
+
+    if pos + 8 > meta.len() {
+        return Err("NefMeta: predictor data truncated".into());
+    }
+
+    let read_u16 = |offset: usize| -> u16 { embedded.decode_u16(&meta[offset..offset + 2]) };
+
+    // Read order matches rawspeed: pUp[0][0], pUp[1][0], pUp[0][1], pUp[1][1]
+    let val0 = read_u16(pos) as i32;
+    let val1 = read_u16(pos + 2) as i32;
+    let val2 = read_u16(pos + 4) as i32;
+    let val3 = read_u16(pos + 6) as i32;
+    pos += 8;
+
+    let mut split_row = 0usize;
+
+    if pos + 2 <= meta.len() {
+        let csize = read_u16(pos) as usize;
+        if v0 == 68 && (v1 == 32 || v1 == 64) && csize > 1 {
+            if 562 + 2 <= meta.len() {
+                split_row = read_u16(562) as usize;
+            }
+        }
+    }
+
+    Ok(NikonLosslessMeta {
+        huff_select,
+        initial_predictors: [[val0, val2], [val1, val3]],
+        split_row,
+    })
 }
 
 fn find_preview_image<R: Read + Seek>(

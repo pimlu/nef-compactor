@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+zstd = "0.13"
 
 [[bin]]
 name = "nef-compactor"
