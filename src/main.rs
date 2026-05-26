@@ -9,19 +9,7 @@ fn main() {
 
     match args[1].as_str() {
         "compress" | "c" => cmd_compress_main(&args[2..]),
-        "decompress" | "d" => {
-            if args.len() < 3 {
-                eprintln!("usage: nef-compactor decompress <input.CNEF> [output.NEF]");
-                std::process::exit(1);
-            }
-            let input = PathBuf::from(&args[2]);
-            let output = if args.len() > 3 {
-                PathBuf::from(&args[3])
-            } else {
-                input.with_extension("NEF")
-            };
-            cmd_decompress(&input, &output);
-        }
+        "decompress" | "d" => cmd_decompress_main(&args[2..]),
         "info" | "i" => {
             if args.len() < 3 {
                 eprintln!("usage: nef-compactor info <input.NEF>");
@@ -37,12 +25,14 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <input | dir> [output]");
+    eprintln!("  compress   [-R] [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <file|dir> [output]");
+    eprintln!("             -R: compress all NEFs in a directory");
     eprintln!("             effort: 1 (fastest) to 10 (slowest), default 3");
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
     eprintln!("             --rm: remove original .NEF after verified write (incompatible with --skip-verify)");
     eprintln!("             -v: show per-segment breakdown");
-    eprintln!("  decompress <input.CNEF> [output.NEF]");
+    eprintln!("  decompress [-R] <file.CNEF|dir> [output]");
+    eprintln!("             -R: decompress all CNEFs in a directory");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
 }
@@ -56,6 +46,7 @@ struct CompressOpts {
     skip_verify: bool,
     verbose: bool,
     remove_originals: bool,
+    recursive: bool,
     input: PathBuf,
     output: Option<PathBuf>,
 }
@@ -75,6 +66,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut skip_verify = false;
     let mut verbose = false;
     let mut remove_originals = false;
+    let mut recursive = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -86,6 +78,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
             "--skip-verify" => skip_verify = true,
             "-v" | "--verbose" => verbose = true,
             "--rm" => remove_originals = true,
+            "-R" => recursive = true,
             _ if args[i].starts_with("-j") => {
                 jobs = args[i][2..].parse().unwrap_or_else(|_| {
                     eprintln!("-j requires a number");
@@ -105,7 +98,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
 
     if positional.is_empty() {
         eprintln!(
-            "usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <input> [output]"
+            "usage: nef-compactor compress [-R] [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <file|dir> [output]"
         );
         std::process::exit(1);
     }
@@ -122,6 +115,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         skip_verify,
         verbose,
         remove_originals,
+        recursive,
         input: PathBuf::from(&positional[0]),
         output: positional.get(1).map(PathBuf::from),
     }
@@ -139,8 +133,16 @@ fn cmd_compress_main(args: &[String]) {
     let opts = parse_compress_args(args);
 
     if opts.input.is_dir() {
+        if !opts.recursive {
+            eprintln!("error: {} is a directory, use -R to compress all NEFs in it", opts.input.display());
+            std::process::exit(1);
+        }
         cmd_compress_dir(&opts);
     } else {
+        if opts.recursive {
+            eprintln!("error: -R requires a directory, not a file");
+            std::process::exit(1);
+        }
         let out_path = opts
             .output
             .unwrap_or_else(|| opts.input.with_extension("CNEF"));
@@ -487,7 +489,68 @@ impl StreamState {
 
 // ─── Decompress ──────────────────────────────────────────────────────────────
 
-fn cmd_decompress(input: &PathBuf, output: &PathBuf) {
+fn cmd_decompress_main(args: &[String]) {
+    let mut recursive = false;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "-R" => recursive = true,
+            _ => positional.push(arg.clone()),
+        }
+    }
+
+    if positional.is_empty() {
+        eprintln!("usage: nef-compactor decompress [-R] <input.CNEF|dir> [output]");
+        std::process::exit(1);
+    }
+
+    let input = PathBuf::from(&positional[0]);
+    let output = positional.get(1).map(PathBuf::from);
+
+    if input.is_dir() {
+        if !recursive {
+            eprintln!(
+                "error: {} is a directory, use -R to decompress all CNEFs in it",
+                input.display()
+            );
+            std::process::exit(1);
+        }
+        let out_dir = output.as_deref().unwrap_or(&input);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&input)
+            .expect("read directory")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("CNEF") {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+
+        if files.is_empty() {
+            eprintln!("no CNEF files found in {}", input.display());
+            std::process::exit(1);
+        }
+
+        for f in &files {
+            let stem = f.file_stem().unwrap().to_string_lossy();
+            let out_path = out_dir.join(format!("{stem}.NEF"));
+            decompress_one(f, &out_path);
+        }
+    } else {
+        if recursive {
+            eprintln!("error: -R requires a directory, not a file");
+            std::process::exit(1);
+        }
+        let out_path = output.unwrap_or_else(|| input.with_extension("NEF"));
+        decompress_one(&input, &out_path);
+    }
+}
+
+fn decompress_one(input: &Path, output: &Path) {
     let mut cnef_file = std::fs::File::open(input).expect("open input CNEF");
     let mut out_file = std::fs::File::create(output).expect("create output NEF");
 

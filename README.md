@@ -21,20 +21,26 @@ Compression ratio depends heavily on ISO — low-ISO images (clean data, high sp
 ## Usage
 
 ```
+# Compress a single file
+nef-compactor compress photo.NEF
+
 # Preview compression ratios without writing anything
-nef-compactor compress --dry-run -e3 -j8 ~/Photos/
+nef-compactor compress --dry-run -e3 -R ~/Photos/
 
 # Compress a directory (8 threads, effort 3)
-nef-compactor compress -e3 -j8 ~/Photos/
+nef-compactor compress -R -e3 -j8 ~/Photos/
 
 # Compress and remove originals after verified write
-nef-compactor compress -e3 -j8 --rm ~/Photos/
+nef-compactor compress -R -e3 -j8 --rm ~/Photos/
 
 # Verbose output showing per-segment breakdown
-nef-compactor compress -e3 -j8 -v ~/Photos/
+nef-compactor compress -R -e3 -j8 -v ~/Photos/
 
-# Decompress back to original NEF
+# Decompress a single file
 nef-compactor decompress photo.CNEF
+
+# Decompress a directory
+nef-compactor decompress -R ~/Photos/
 
 # Inspect a NEF file's structure
 nef-compactor info photo.NEF
@@ -44,6 +50,7 @@ nef-compactor info photo.NEF
 
 | Flag | Description |
 |---|---|
+| `-R` | Operate on all NEF/CNEF files in a directory |
 | `-e N` | JXL effort 1 (fastest) to 10 (slowest), default 3 |
 | `-j N` | Number of parallel threads |
 | `--dry-run` | Show ratios without writing files |
