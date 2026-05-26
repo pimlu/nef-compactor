@@ -87,12 +87,25 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf) {
         output.file_name().unwrap().to_string_lossy(),
     );
     println!(
-        "  {} segments, {} → {} bytes ({:.1}%)",
-        stats.segment_count,
-        stats.original_size,
-        cnef_size,
-        ratio * 100.0,
+        "  total: {} → {} bytes ({:.1}%)",
+        stats.original_size, cnef_size, ratio * 100.0,
     );
+    for seg in &stats.segments {
+        let label = match seg.seg_type {
+            nef_compactor::cnef::SegmentType::Zstd => "zstd",
+            nef_compactor::cnef::SegmentType::RawPixelsJxl => "raw→jxl",
+            nef_compactor::cnef::SegmentType::JpegJxl => "jpeg→jxl",
+        };
+        let seg_ratio = if seg.original_size > 0 {
+            seg.compressed_size as f64 / seg.original_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "    {:<10} {:>10} → {:>10} ({:.1}%)",
+            label, seg.original_size, seg.compressed_size, seg_ratio,
+        );
+    }
 }
 
 fn cmd_decompress(input: &PathBuf, output: &PathBuf) {

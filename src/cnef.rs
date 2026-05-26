@@ -205,6 +205,7 @@ pub fn compress<R: Read + Seek, W: Write>(
     // Write CNEF
     let mut total_compressed: u64 = 0;
     let mut total_original: u64 = 0;
+    let mut seg_stats: Vec<SegmentStats> = Vec::new();
 
     // Header
     out.write_all(MAGIC).w()?;
@@ -231,7 +232,13 @@ pub fn compress<R: Read + Seek, W: Write>(
 
         out.write_all(&seg.payload).w()?;
 
-        total_compressed += seg.payload.len() as u64;
+        let payload_len = seg.payload.len() as u64;
+        seg_stats.push(SegmentStats {
+            seg_type: seg.seg_type,
+            original_size: seg.original_length,
+            compressed_size: payload_len,
+        });
+        total_compressed += payload_len;
         total_original += seg.original_length;
     }
 
@@ -239,6 +246,7 @@ pub fn compress<R: Read + Seek, W: Write>(
         original_size: total_original,
         compressed_size: total_compressed,
         segment_count: segments.len(),
+        segments: seg_stats,
     })
 }
 
@@ -362,6 +370,14 @@ pub struct CompressionStats {
     pub original_size: u64,
     pub compressed_size: u64,
     pub segment_count: usize,
+    pub segments: Vec<SegmentStats>,
+}
+
+#[derive(Debug)]
+pub struct SegmentStats {
+    pub seg_type: SegmentType,
+    pub original_size: u64,
+    pub compressed_size: u64,
 }
 
 #[derive(Debug)]
