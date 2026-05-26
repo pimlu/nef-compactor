@@ -414,21 +414,6 @@ fn zstd_decompress(data: &[u8], _expected_size: usize) -> Result<Vec<u8>, String
     zstd::decode_all(std::io::Cursor::new(data)).map_err(|e| format!("zstd decompress: {e}"))
 }
 
-fn pixels_to_bytes(pixels: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(pixels.len() * 2);
-    for &p in pixels {
-        bytes.extend_from_slice(&p.to_le_bytes());
-    }
-    bytes
-}
-
-fn bytes_to_pixels(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
 fn read_u8<R: Read>(r: &mut R) -> Result<u8, String> {
     let mut buf = [0u8; 1];
     r.read_exact(&mut buf).r()?;
