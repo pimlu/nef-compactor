@@ -28,6 +28,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::jxl;
 use crate::nef::{NefChunks, NikonLosslessMeta};
 use crate::nikon_lossless;
 use crate::tiff::COMPRESSION_NIKON_LOSSLESS;
@@ -41,14 +42,16 @@ const ZSTD_LEVEL: i32 = 19;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentType {
     Zstd = 1,
-    RawPixels = 2,
+    RawPixelsJxl = 2,
+    JpegJxl = 3,
 }
 
 impl SegmentType {
     fn from_u8(v: u8) -> Result<Self, String> {
         match v {
             1 => Ok(Self::Zstd),
-            2 => Ok(Self::RawPixels),
+            2 => Ok(Self::RawPixelsJxl),
+            3 => Ok(Self::JpegJxl),
             _ => Err(format!("unknown segment type {v}")),
         }
     }
@@ -95,7 +98,7 @@ pub fn compress<R: Read + Seek, W: Write>(
         ));
     }
     for jpeg in &chunks.jpegs {
-        regions.push((jpeg.offset, jpeg.length as u64, RegionKind::Blob));
+        regions.push((jpeg.offset, jpeg.length as u64, RegionKind::Jpeg));
     }
 
     regions.sort_by_key(|r| r.0);
@@ -134,12 +137,15 @@ pub fn compress<R: Read + Seek, W: Write>(
                     meta.split_row,
                 )?;
 
-                // Compress raw pixels with zstd (JXL replacement comes later)
-                let pixel_bytes = pixels_to_bytes(&pixels);
-                let compressed_pixels = zstd_compress(&pixel_bytes)?;
+                let compressed_pixels = jxl::encode_pixels(
+                    &pixels,
+                    chunks.raw_strip.width,
+                    chunks.raw_strip.height,
+                    bps,
+                )?;
 
                 segments.push(Segment {
-                    seg_type: SegmentType::RawPixels,
+                    seg_type: SegmentType::RawPixelsJxl,
                     original_offset: offset,
                     original_length: length,
                     payload: compressed_pixels,
@@ -156,6 +162,17 @@ pub fn compress<R: Read + Seek, W: Write>(
                             meta.initial_predictors[1][1],
                         ],
                     }),
+                });
+            }
+            RegionKind::Jpeg => {
+                let jpeg_data = read_range(nef, offset, length as usize)?;
+                let jxl_data = jxl::encode_jpeg(&jpeg_data)?;
+                segments.push(Segment {
+                    seg_type: SegmentType::JpegJxl,
+                    original_offset: offset,
+                    original_length: length,
+                    payload: jxl_data,
+                    raw_meta: None,
                 });
             }
             RegionKind::Blob => {
@@ -252,7 +269,7 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
         let original_length = read_u64_le(input)?;
         let compressed_length = read_u64_le(input)? as usize;
 
-        let raw_meta = if seg_type == SegmentType::RawPixels {
+        let raw_meta = if seg_type == SegmentType::RawPixelsJxl {
             Some(RawPixelsMeta {
                 width: read_u32_le(input)?,
                 height: read_u32_le(input)?,
@@ -279,10 +296,22 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
                 out.write_all(&decompressed).w()?;
                 reconstructed_size += decompressed.len() as u64;
             }
-            SegmentType::RawPixels => {
+            SegmentType::JpegJxl => {
+                let jpeg_bytes = jxl::decode_jpeg(&payload)?;
+                let needed = original_length as usize;
+                if jpeg_bytes.len() != needed {
+                    return Err(format!(
+                        "JPEG reconstruction size {} != expected {}",
+                        jpeg_bytes.len(),
+                        needed,
+                    ));
+                }
+                out.write_all(&jpeg_bytes).w()?;
+                reconstructed_size += needed as u64;
+            }
+            SegmentType::RawPixelsJxl => {
                 let m = raw_meta.unwrap();
-                let pixel_bytes = zstd_decompress(&payload, 0)?;
-                let pixels = bytes_to_pixels(&pixel_bytes);
+                let (pixels, _, _) = jxl::decode_pixels(&payload)?;
 
                 let nikon_compressed = nikon_lossless::encode(
                     &pixels,
@@ -343,6 +372,7 @@ pub struct DecompressionStats {
 #[derive(Clone, Copy)]
 enum RegionKind {
     RawStrip,
+    Jpeg,
     Blob,
 }
 
