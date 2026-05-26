@@ -1,6 +1,6 @@
 # nef-compactor
 
-Lossless compression for Nikon NEF files. Produces `.cnef` files that are 20-40% smaller than the originals and decompress back to byte-identical NEFs.
+Lossless compression for Nikon NEF files. Produces `.CNEF` files that are 20-40% smaller than the originals and decompress back to byte-identical NEFs.
 
 Uses JPEG XL for raw sensor data and embedded JPEGs, zstd for metadata. No patent-encumbered codecs — HE/HE\* NEFs (which use JPEG XS internally) are detected and skipped.
 
@@ -34,7 +34,7 @@ nef-compactor compress -e3 -j8 --rm ~/Photos/
 nef-compactor compress -e3 -j8 -v ~/Photos/
 
 # Decompress back to original NEF
-nef-compactor decompress photo.cnef
+nef-compactor decompress photo.CNEF
 
 # Inspect a NEF file's structure
 nef-compactor info photo.NEF

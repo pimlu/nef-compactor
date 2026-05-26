@@ -11,7 +11,7 @@ fn main() {
         "compress" | "c" => cmd_compress_main(&args[2..]),
         "decompress" | "d" => {
             if args.len() < 3 {
-                eprintln!("usage: nef-compactor decompress <input.cnef> [output.NEF]");
+                eprintln!("usage: nef-compactor decompress <input.CNEF> [output.NEF]");
                 std::process::exit(1);
             }
             let input = PathBuf::from(&args[2]);
@@ -40,9 +40,9 @@ fn usage() -> ! {
     eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <input | dir> [output]");
     eprintln!("             effort: 1 (fastest) to 10 (slowest), default 3");
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
-    eprintln!("             --rm: remove original .NEF after verified write (incompatible with --dry-run, --skip-verify)");
+    eprintln!("             --rm: remove original .NEF after verified write (incompatible with --skip-verify)");
     eprintln!("             -v: show per-segment breakdown");
-    eprintln!("  decompress <input.cnef> [output.NEF]");
+    eprintln!("  decompress <input.CNEF> [output.NEF]");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
 }
@@ -143,7 +143,7 @@ fn cmd_compress_main(args: &[String]) {
     } else {
         let out_path = opts
             .output
-            .unwrap_or_else(|| opts.input.with_extension("cnef"));
+            .unwrap_or_else(|| opts.input.with_extension("CNEF"));
         match compress_one(&opts.input, opts.effort, opts.skip_verify) {
             Ok(result) => {
                 if !opts.dry_run {
@@ -309,7 +309,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
                 None
             } else {
                 let stem = f.file_stem().unwrap().to_string_lossy();
-                Some(out_dir.join(format!("{stem}.cnef")))
+                Some(out_dir.join(format!("{stem}.CNEF")))
             }
         })
         .collect();
