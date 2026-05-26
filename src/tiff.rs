@@ -19,6 +19,18 @@ pub const TYPE_SHORT: u16 = 3;
 pub const TYPE_LONG: u16 = 4;
 pub const TYPE_UNDEFINED: u16 = 7;
 
+impl RawEntry {
+    pub fn byte_size(&self) -> usize {
+        let shift = match self.field_type {
+            TYPE_SHORT => 1,
+            TYPE_LONG => 2,
+            5 => 3, // RATIONAL
+            _ => 0, // BYTE, ASCII, UNDEFINED
+        };
+        (self.count as usize) << shift
+    }
+}
+
 pub const TAG_IMAGE_WIDTH: u16 = 0x0100;
 pub const TAG_IMAGE_LENGTH: u16 = 0x0101;
 pub const TAG_BITS_PER_SAMPLE: u16 = 0x0102;

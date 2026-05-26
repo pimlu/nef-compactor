@@ -25,6 +25,7 @@ pub struct RawStrip {
     pub height: u32,
     pub bits_per_sample: u32,
     pub compression: u32,
+    pub is_jpeg_xs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,7 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
                         .as_ref()
                         .map_or(true, |r| width * height > r.width * r.height);
                     if is_bigger {
+                        let is_jpeg_xs = detect_jpeg_xs(reader, strip_offset)?;
                         raw_strip = Some(RawStrip {
                             offset: strip_offset,
                             length: strip_length,
@@ -120,6 +122,7 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
                             height,
                             bits_per_sample: bps,
                             compression,
+                            is_jpeg_xs,
                         });
                     }
                 }
@@ -205,6 +208,19 @@ fn jpeg_from_inline_pointers<R: Read + Seek>(
     }))
 }
 
+const JPEG_XS_SOC_CAP: [u8; 4] = [0xFF, 0x10, 0xFF, 0x50];
+
+fn detect_jpeg_xs<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<bool, String> {
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek to strip: {e}"))?;
+    let mut buf = [0u8; 4];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read strip header: {e}"))?;
+    Ok(buf == JPEG_XS_SOC_CAP)
+}
+
 pub fn read_nikon_lossless_meta<R: Read + Seek>(
     reader: &mut R,
     chunks: &NefChunks,
@@ -244,13 +260,13 @@ pub fn read_nikon_lossless_meta<R: Read + Seek>(
         .or_else(|| embedded.find_entry(&nikon_ifd, 0x008C))
         .ok_or("no NefMeta tag")?;
 
-    let meta_offset = if meta_entry.count > 4 {
+    let meta_byte_size = meta_entry.byte_size();
+    let meta_offset = if meta_byte_size > 4 {
         embedded.abs_from_ifd_offset(embedded.decode_u32(&meta_entry.value_bytes))
     } else {
         return Err("NefMeta too small".into());
     };
-    let meta_len = meta_entry.count as usize;
-    let meta_bytes = main.read_bytes(reader, meta_offset as u64, meta_len)?;
+    let meta_bytes = main.read_bytes(reader, meta_offset as u64, meta_byte_size)?;
 
     parse_nikon_meta(&meta_bytes, &embedded, chunks.raw_strip.bits_per_sample)
 }
@@ -268,7 +284,7 @@ fn parse_nikon_meta(
     let v1 = meta[1];
 
     let mut pos = 2usize;
-    if v0 == 73 || v1 == 88 {
+    if (v0 == 73 || v1 == 88) && pos + 2110 + 8 <= meta.len() {
         pos += 2110;
     }
 

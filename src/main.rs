@@ -37,9 +37,10 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [-v] <input | dir> [output]");
+    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <input | dir> [output]");
     eprintln!("             effort: 1 (fastest) to 10 (slowest), default 3");
     eprintln!("             verify roundtrip by default; --skip-verify to disable");
+    eprintln!("             --rm: remove original .NEF after verified write (incompatible with --dry-run, --skip-verify)");
     eprintln!("             -v: show per-segment breakdown");
     eprintln!("  decompress <input.cnef> [output.NEF]");
     eprintln!("  info       <input.NEF>");
@@ -54,6 +55,7 @@ struct CompressOpts {
     dry_run: bool,
     skip_verify: bool,
     verbose: bool,
+    remove_originals: bool,
     input: PathBuf,
     output: Option<PathBuf>,
 }
@@ -72,6 +74,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut dry_run = false;
     let mut skip_verify = false;
     let mut verbose = false;
+    let mut remove_originals = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -82,6 +85,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
             "--dry-run" => dry_run = true,
             "--skip-verify" => skip_verify = true,
             "-v" | "--verbose" => verbose = true,
+            "--rm" => remove_originals = true,
             _ if args[i].starts_with("-j") => {
                 jobs = args[i][2..].parse().unwrap_or_else(|_| {
                     eprintln!("-j requires a number");
@@ -101,8 +105,13 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
 
     if positional.is_empty() {
         eprintln!(
-            "usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [-v] <input> [output]"
+            "usage: nef-compactor compress [-j N] [-e EFFORT] [--dry-run] [--skip-verify] [--rm] [-v] <input> [output]"
         );
+        std::process::exit(1);
+    }
+
+    if remove_originals && skip_verify {
+        eprintln!("error: --rm cannot be used with --skip-verify");
         std::process::exit(1);
     }
 
@@ -112,9 +121,18 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         dry_run,
         skip_verify,
         verbose,
+        remove_originals,
         input: PathBuf::from(&positional[0]),
         output: positional.get(1).map(PathBuf::from),
     }
+}
+
+fn write_and_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 fn cmd_compress_main(args: &[String]) {
@@ -130,7 +148,10 @@ fn cmd_compress_main(args: &[String]) {
             Ok(result) => {
                 if !opts.dry_run {
                     if let Some(ref data) = result.cnef_data {
-                        std::fs::write(&out_path, data).expect("write output");
+                        write_and_sync(&out_path, data).expect("write output");
+                        if opts.remove_originals {
+                            std::fs::remove_file(&opts.input).expect("remove original");
+                        }
                     }
                 }
                 print_compress_result(&result, opts.verbose, opts.dry_run);
@@ -186,6 +207,10 @@ fn compress_one(
     let mut nef_file = std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
     let chunks = nef_compactor::nef::scan_nef(&mut nef_file)?;
 
+    if chunks.raw_strip.is_jpeg_xs {
+        return Err("HE/HE* NEF (JPEG XS raw strip), not supported".into());
+    }
+
     let lossless_meta = if chunks.raw_strip.compression
         == nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS
     {
@@ -193,7 +218,8 @@ fn compress_one(
             Ok(m) => Some(m),
             Err(e) => {
                 eprintln!(
-                    "  warning: can't read lossless meta ({e}), raw strip will use zstd"
+                    "  warning: {}: can't read lossless meta ({e}), raw strip will use zstd",
+                    input.display()
                 );
                 None
             }
@@ -292,6 +318,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
     let skip_verify = opts.skip_verify;
     let verbose = opts.verbose;
     let dry_run = opts.dry_run;
+    let remove_originals = opts.remove_originals;
 
     // Shared state for in-order streaming output
     let state = StreamState::new(files.len());
@@ -302,14 +329,14 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         for i in 0..n {
             let result = compress_one(&files[i], effort, skip_verify);
             state.publish(i, result);
-            state.drain(&files, &out_paths, verbose, dry_run);
+            state.drain(&files, &out_paths, verbose, dry_run, remove_originals);
         }
     } else {
         let next_idx = Mutex::new(0usize);
 
         std::thread::scope(|scope| {
             let drainer = scope.spawn(|| {
-                state.drain_blocking(n, &files, &out_paths, verbose, dry_run);
+                state.drain_blocking(n, &files, &out_paths, verbose, dry_run, remove_originals);
             });
 
             for _ in 0..opts.jobs {
@@ -377,6 +404,7 @@ impl StreamState {
         out_paths: &[Option<PathBuf>],
         verbose: bool,
         dry_run: bool,
+        remove_originals: bool,
     ) {
         let mut inner = self.inner.lock().unwrap();
         while inner.next_print < inner.slots.len() {
@@ -390,10 +418,15 @@ impl StreamState {
                 Ok(r) => {
                     if !dry_run {
                         if let (Some(data), Some(path)) = (&r.cnef_data, &out_paths[idx]) {
-                            if let Err(e) = std::fs::write(path, data) {
+                            if let Err(e) = write_and_sync(path, data) {
                                 eprintln!("{}: write failed ({e})", r.input_name);
                                 inner.failed += 1;
                                 continue;
+                            }
+                            if remove_originals {
+                                if let Err(e) = std::fs::remove_file(&files[idx]) {
+                                    eprintln!("{}: remove failed ({e})", r.input_name);
+                                }
                             }
                         }
                     }
@@ -418,9 +451,10 @@ impl StreamState {
         out_paths: &[Option<PathBuf>],
         verbose: bool,
         dry_run: bool,
+        remove_originals: bool,
     ) {
         loop {
-            self.drain(files, out_paths, verbose, dry_run);
+            self.drain(files, out_paths, verbose, dry_run, remove_originals);
             let inner = self.inner.lock().unwrap();
             if inner.next_print >= n {
                 return;
