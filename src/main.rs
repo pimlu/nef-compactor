@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
+use lexopt::prelude::*;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -38,6 +40,11 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("error: {msg}");
+    std::process::exit(1);
+}
+
 // ─── Compress ────────────────────────────────────────────────────────────────
 
 struct CompressOpts {
@@ -52,14 +59,6 @@ struct CompressOpts {
     output: Option<PathBuf>,
 }
 
-fn parse_num_after_flag(args: &[String], i: &mut usize, flag: &str) -> Option<i64> {
-    *i += 1;
-    args.get(*i).and_then(|s| s.parse().ok()).or_else(|| {
-        eprintln!("{flag} requires a number");
-        std::process::exit(1);
-    })
-}
-
 fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut jobs = 1usize;
     let mut effort = 3i64;
@@ -70,31 +69,21 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut recursive = false;
     let mut positional = Vec::new();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-j" => jobs = parse_num_after_flag(args, &mut i, "-j").unwrap() as usize,
-            "-e" => effort = parse_num_after_flag(args, &mut i, "-e").unwrap(),
-            "--dry-run" => dry_run = true,
-            "--skip-verify" => skip_verify = true,
-            "-v" | "--verbose" => verbose = true,
-            "--rm" => remove_originals = true,
-            "-R" => recursive = true,
-            _ if args[i].starts_with("-j") => {
-                jobs = args[i][2..].parse().unwrap_or_else(|_| {
-                    eprintln!("-j requires a number");
-                    std::process::exit(1);
-                });
-            }
-            _ if args[i].starts_with("-e") => {
-                effort = args[i][2..].parse().unwrap_or_else(|_| {
-                    eprintln!("-e requires a number");
-                    std::process::exit(1);
-                });
-            }
-            _ => positional.push(args[i].clone()),
+    let mut parser = lexopt::Parser::from_args(args);
+    while let Some(arg) = parser.next().unwrap_or_else(|e| die(e)) {
+        match arg {
+            Short('j') => jobs = parser.value().unwrap_or_else(|e| die(e))
+                .parse().unwrap_or_else(|e| die(format!("-j: {e}"))),
+            Short('e') => effort = parser.value().unwrap_or_else(|e| die(e))
+                .parse().unwrap_or_else(|e| die(format!("-e: {e}"))),
+            Short('v') | Long("verbose") => verbose = true,
+            Short('R') => recursive = true,
+            Long("dry-run") => dry_run = true,
+            Long("skip-verify") => skip_verify = true,
+            Long("rm") => remove_originals = true,
+            Value(val) => positional.push(val.into()),
+            _ => die(arg.unexpected()),
         }
-        i += 1;
     }
 
     if positional.is_empty() {
@@ -105,8 +94,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     }
 
     if remove_originals && skip_verify {
-        eprintln!("error: --rm cannot be used with --skip-verify");
-        std::process::exit(1);
+        die("--rm cannot be used with --skip-verify");
     }
 
     CompressOpts {
@@ -117,8 +105,8 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         verbose,
         remove_originals,
         recursive,
-        input: PathBuf::from(&positional[0]),
-        output: positional.get(1).map(PathBuf::from),
+        input: positional.remove(0),
+        output: positional.into_iter().next(),
     }
 }
 
@@ -135,14 +123,12 @@ fn cmd_compress_main(args: &[String]) {
 
     if opts.input.is_dir() {
         if !opts.recursive {
-            eprintln!("error: {} is a directory, use -R to compress all NEFs in it", opts.input.display());
-            std::process::exit(1);
+            die(format!("{} is a directory, use -R to compress all NEFs in it", opts.input.display()));
         }
         cmd_compress_dir(&opts);
     } else {
         if opts.recursive {
-            eprintln!("error: -R requires a directory, not a file");
-            std::process::exit(1);
+            die(format!("-R requires a directory, got file: {}", opts.input.display()));
         }
         let out_path = opts
             .output
@@ -494,32 +480,18 @@ fn cmd_decompress_main(args: &[String]) {
     let mut recursive = false;
     let mut remove_originals = false;
     let mut jobs = 1usize;
-    let mut positional = Vec::new();
+    let mut positional: Vec<PathBuf> = Vec::new();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-R" => recursive = true,
-            "--rm" => remove_originals = true,
-            "-j" => {
-                i += 1;
-                jobs = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("-j requires a number");
-                        std::process::exit(1);
-                    });
-            }
-            _ if args[i].starts_with("-j") => {
-                jobs = args[i][2..].parse().unwrap_or_else(|_| {
-                    eprintln!("-j requires a number");
-                    std::process::exit(1);
-                });
-            }
-            _ => positional.push(args[i].clone()),
+    let mut parser = lexopt::Parser::from_args(args);
+    while let Some(arg) = parser.next().unwrap_or_else(|e| die(e)) {
+        match arg {
+            Short('R') => recursive = true,
+            Short('j') => jobs = parser.value().unwrap_or_else(|e| die(e))
+                .parse().unwrap_or_else(|e| die(format!("-j: {e}"))),
+            Long("rm") => remove_originals = true,
+            Value(val) => positional.push(val.into()),
+            _ => die(arg.unexpected()),
         }
-        i += 1;
     }
 
     if positional.is_empty() {
@@ -527,22 +499,17 @@ fn cmd_decompress_main(args: &[String]) {
         std::process::exit(1);
     }
 
-    let input = PathBuf::from(&positional[0]);
-    let output = positional.get(1).map(PathBuf::from);
+    let input = positional.remove(0);
+    let output = positional.into_iter().next();
 
     if input.is_dir() {
         if !recursive {
-            eprintln!(
-                "error: {} is a directory, use -R to decompress all CNEFs in it",
-                input.display()
-            );
-            std::process::exit(1);
+            die(format!("{} is a directory, use -R to decompress all CNEFs in it", input.display()));
         }
         cmd_decompress_dir(&input, output.as_deref(), jobs, remove_originals);
     } else {
         if recursive {
-            eprintln!("error: -R requires a directory, not a file");
-            std::process::exit(1);
+            die(format!("-R requires a directory, got file: {}", input.display()));
         }
         let out_path = output.unwrap_or_else(|| input.with_extension("NEF"));
         match decompress_one(&input) {
