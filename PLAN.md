@@ -47,15 +47,26 @@ A NEF file is a TIFF container with several large binary chunks:
 - **Roundtrip test** (`src/bin/roundtrip_test.rs`): reads a NEF, decodes the raw strip, re-encodes, asserts byte-for-byte equality. Tested on 3 legacy NEF files from Z50 II — all pass bit-perfect.
 - **CNEF container format** (`src/cnef.rs`): binary container that splits the NEF into segments at chunk boundaries, compresses each independently, and reconstructs the original NEF byte-for-byte on decompression. Segments are ordered by file offset — decompression concatenates them without TIFF offset patching.
 - **CLI** (`src/main.rs`): `compress`, `decompress`, and `info` commands.
-- **Full NEF → CNEF → NEF roundtrip verified** on all 3 test files with `diff`. Currently uses zstd for all segments (including raw pixels), so CNEF files are *larger* than originals — JXL integration is the next step.
+- **Full NEF → CNEF → NEF roundtrip verified** on all 3 test files with `diff`.
+- **JPEG XL integration** (`src/jxl.rs`): wraps libjxl (vendored via `jpegxl-rs`) for both raw pixel encoding and JPEG recompression.
+  - **Raw strip**: Nikon decode → Bayer deinterleave (4 half-res channels) → JXL lossless. The deinterleave was the key insight: JXL compressing the raw mosaic barely beat Nikon's Huffman, but deinterleaving into spatially-coherent channels dropped the raw strip to 79–96% of original.
+  - **JPEG thumbnails**: JXL JPEG recompression (71–91% of original, bit-perfect JPEG reconstruction).
+  - **Skeleton metadata**: zstd (42–89% of original).
+- **Per-segment compression stats** in CLI output.
 
-### Next: JPEG XL integration
+#### Compression results (3 Z50 II test files, 14-bit lossless NEF):
 
-This is the critical step that makes compression actually *compress*.
+| File | Original | CNEF | Ratio | Raw strip ratio |
+|---|---|---|---|---|
+| DSC_1250 | 25.5 MB | 22.7 MB | 88.9% | 90.1% |
+| DSC_1304 | 28.5 MB | 26.8 MB | 94.4% | 96.1% |
+| DSC_3711 | 22.0 MB | 17.4 MB | 79.1% | 79.2% |
 
-- Add `jxl-oxide` or `libjxl` dependency for JPEG XL encoding/decoding
-- **Raw strip**: decode Nikon lossless → 14-bit Bayer pixels → JXL lossless encode. New segment type in CNEF. Expected to beat Nikon's 2007 Huffman by a significant margin.
-- **JPEG thumbnails**: JXL JPEG recompression (lossless transcode, ~20% savings, original JPEG reconstructible bit-for-bit). New segment type in CNEF.
+#### What was tried and didn't help:
+- **G-channel lifting** (store avg(G1,G2) + delta): −0.4% to +0.9%, essentially noise. JXL modular mode already decorrelates the G channels via MA trees.
+- **RGB+alpha arrangement** (R,G1,B as color + G2 as alpha): +0.1% to +0.9% worse. The alpha channel gets inferior treatment (no RCT).
+- **JXL effort 9**: ~0.5% better compression for 5× longer encode time.
+- **14-bit vs 16-bit declared depth**: identical compression — JXL modular mode adapts to actual value range.
 
 ### Future
 
