@@ -37,8 +37,9 @@ fn usage() -> ! {
     eprintln!("usage: nef-compactor <command> [args...]");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] <input.NEF | dir> [output]");
+    eprintln!("  compress   [-j N] [-e EFFORT] [--dry-run] [--skip-verify] <input | dir> [output]");
     eprintln!("             effort: 1 (fastest) to 10 (slowest), default 7");
+    eprintln!("             verify roundtrip by default; --skip-verify to disable");
     eprintln!("  decompress <input.cnef> [output.NEF]");
     eprintln!("  info       <input.NEF>");
     std::process::exit(1);
@@ -50,6 +51,7 @@ struct CompressOpts {
     jobs: usize,
     effort: i64,
     dry_run: bool,
+    skip_verify: bool,
     input: PathBuf,
     output: Option<PathBuf>,
 }
@@ -66,6 +68,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
     let mut jobs = 1usize;
     let mut effort = 7i64;
     let mut dry_run = false;
+    let mut skip_verify = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -74,6 +77,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
             "-j" => jobs = parse_num_after_flag(args, &mut i, "-j").unwrap() as usize,
             "-e" => effort = parse_num_after_flag(args, &mut i, "-e").unwrap(),
             "--dry-run" => dry_run = true,
+            "--skip-verify" => skip_verify = true,
             _ if args[i].starts_with("-j") => {
                 jobs = args[i][2..].parse().unwrap_or_else(|_| {
                     eprintln!("-j requires a number");
@@ -100,6 +104,7 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         jobs,
         effort: effort.clamp(1, 10),
         dry_run,
+        skip_verify,
         input: PathBuf::from(&positional[0]),
         output: positional.get(1).map(PathBuf::from),
     }
@@ -114,7 +119,7 @@ fn cmd_compress_main(args: &[String]) {
         let output = opts
             .output
             .unwrap_or_else(|| opts.input.with_extension("cnef"));
-        match compress_one(&opts.input, if opts.dry_run { None } else { Some(&output) }, opts.effort) {
+        match compress_one(&opts.input, if opts.dry_run { None } else { Some(&output) }, opts.effort, opts.skip_verify) {
             Ok(result) => print_compress_result(&result),
             Err(e) => {
                 eprintln!("{}: {e}", opts.input.display());
@@ -153,9 +158,9 @@ fn print_compress_result(r: &CompressResult) {
     }
 }
 
-/// Compress a single NEF. If `output` is None, compress to a temporary
-/// buffer and discard (dry-run mode).
-fn compress_one(input: &Path, output: Option<&Path>, effort: i64) -> Result<CompressResult, String> {
+fn compress_one(input: &Path, output: Option<&Path>, effort: i64, skip_verify: bool) -> Result<CompressResult, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
     let mut nef_file = std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
     let chunks = nef_compactor::nef::scan_nef(&mut nef_file)?;
 
@@ -177,32 +182,39 @@ fn compress_one(input: &Path, output: Option<&Path>, effort: i64) -> Result<Comp
 
     let original_size = chunks.file_size;
 
-    let (stats, cnef_size) = if let Some(out_path) = output {
-        let mut out_file =
-            std::fs::File::create(out_path).map_err(|e| format!("create output: {e}"))?;
-        let stats = nef_compactor::cnef::compress(
-            &mut nef_file,
-            &chunks,
-            lossless_meta.as_ref(),
-            effort,
-            &mut out_file,
-        )?;
-        let cnef_size = std::fs::metadata(out_path)
-            .map_err(|e| format!("stat output: {e}"))?
-            .len();
-        (stats, cnef_size)
-    } else {
-        let mut buf = Vec::new();
-        let stats = nef_compactor::cnef::compress(
-            &mut nef_file,
-            &chunks,
-            lossless_meta.as_ref(),
-            effort,
-            &mut buf,
-        )?;
-        let cnef_size = buf.len() as u64;
-        (stats, cnef_size)
-    };
+    let mut cnef_buf = Vec::new();
+    let stats = nef_compactor::cnef::compress(
+        &mut nef_file,
+        &chunks,
+        lossless_meta.as_ref(),
+        effort,
+        &mut cnef_buf,
+    )?;
+    let cnef_size = cnef_buf.len() as u64;
+
+    if !skip_verify {
+        let mut cursor = std::io::Cursor::new(&cnef_buf);
+        let mut reconstructed = Vec::new();
+        nef_compactor::cnef::decompress(&mut cursor, &mut reconstructed)?;
+
+        nef_file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek: {e}"))?;
+        let mut original = Vec::with_capacity(original_size as usize);
+        nef_file.read_to_end(&mut original).map_err(|e| format!("read original: {e}"))?;
+
+        if original != reconstructed {
+            let first_diff = original.iter().zip(reconstructed.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(original.len().min(reconstructed.len()));
+            return Err(format!(
+                "verification failed: mismatch at byte {first_diff} (original {} bytes, reconstructed {} bytes)",
+                original.len(), reconstructed.len(),
+            ));
+        }
+    }
+
+    if let Some(out_path) = output {
+        std::fs::write(out_path, &cnef_buf).map_err(|e| format!("write output: {e}"))?;
+    }
 
     let input_name = input.file_name().unwrap().to_string_lossy().to_string();
     let output_name = if let Some(p) = output {
@@ -260,13 +272,14 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         .collect();
 
     let effort = opts.effort;
+    let skip_verify = opts.skip_verify;
     let results: Vec<Result<CompressResult, String>> = if opts.jobs <= 1 {
         tasks
             .iter()
-            .map(|(input, output)| compress_one(input, output.as_deref(), effort))
+            .map(|(input, output)| compress_one(input, output.as_deref(), effort, skip_verify))
             .collect()
     } else {
-        parallel_compress(&tasks, opts.jobs, effort)
+        parallel_compress(&tasks, opts.jobs, effort, skip_verify)
     };
 
     let mut compressed = 0u64;
@@ -315,6 +328,7 @@ fn parallel_compress(
     tasks: &[(PathBuf, Option<PathBuf>)],
     jobs: usize,
     effort: i64,
+    skip_verify: bool,
 ) -> Vec<Result<CompressResult, String>> {
     let n = tasks.len();
     let results: Vec<Mutex<Option<Result<CompressResult, String>>>> =
@@ -335,7 +349,7 @@ fn parallel_compress(
                 };
 
                 let (input, output) = &tasks[idx];
-                let result = compress_one(input, output.as_deref(), effort);
+                let result = compress_one(input, output.as_deref(), effort, skip_verify);
                 *results[idx].lock().unwrap() = Some(result);
             });
         }
