@@ -187,27 +187,6 @@ unsafe fn encode_4ch_ffi(
         },
         "SetEffort",
     )?;
-    // Force modular mode (not VarDCT)
-    enc_check(
-        unsafe {
-            JxlEncoderFrameSettingsSetOption(opts, JxlEncoderFrameSettingId::Modular, 1)
-        },
-        "SetModular",
-    )?;
-    // No color transform — our channels are Bayer phases, not RGB
-    enc_check(
-        unsafe {
-            JxlEncoderFrameSettingsSetOption(opts, JxlEncoderFrameSettingId::ColorTransform, 1)
-        },
-        "SetColorTransform",
-    )?;
-    // Allow all 3 previous channels as prediction context
-    enc_check(
-        unsafe {
-            JxlEncoderFrameSettingsSetOption(opts, JxlEncoderFrameSettingId::ModularNbPrevChannels, 3)
-        },
-        "SetModularNbPrevChannels",
-    )?;
 
     let bit_depth = JxlBitDepth {
         r#type: JxlBitDepthType::FromCodestream,
