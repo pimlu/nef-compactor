@@ -1,8 +1,8 @@
 [package]
 name = "nef-compactor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Lossless NEF compressor — re-encodes Nikon raw files with JPEG XL for 20-40% smaller files, with bit-perfect decompression"
+description = "Lossless recompression of Nikon .NEF raw files with JPEG XL"
 license = "MIT"
 repository = "https://github.com/pimlu/nef-compactor"
 readme = "README.md"

@@ -9,13 +9,11 @@ The compression ratio depends on the content of the files -- fundamentally noise
 
 It works by re-encoding the raw data/JPEG thumbnails with lossless JPEG XL, which is completely free for open source software to use.
 
-## HE/HE★ FAQ
+## Installing
 
-nef-compactor *does not support HE/HE★* files, since no open-source software does.  It's patent-encumbered, meaning if you're not careful, even a clean room reverse engineered implementation can violate somebody's patents.
-
-### Why is HE/HE★ smaller than nef-compactor?
-
-It's actually a lossy format, they're throwing data away to get that compression.
+```
+cargo install --locked nef-compactor
+```
 
 ## Usage
 
@@ -40,7 +38,6 @@ nef-compactor decompress -R -j8 ~/Photos/
 
 # Verbose output showing per-segment breakdown
 nef-compactor compress -R -j8 --dry-run -v /Volumes/Foo/DCIM/100NZ502
-
 ```
 
 ### Flags
@@ -53,6 +50,15 @@ nef-compactor compress -R -j8 --dry-run -v /Volumes/Foo/DCIM/100NZ502
 | `--skip-verify` | Skip roundtrip verification (faster, less safe) |
 | `--rm` | Remove original `.NEF` after verified, fsynced write. Incompatible with `--skip-verify` |
 | `-v` | Show per-segment compression breakdown |
+
+## HE/HE★ FAQ
+
+nef-compactor *does not support HE/HE★* files, since no open-source software does.  It's patent-encumbered, meaning if you're not careful, even a clean room reverse engineered implementation can violate somebody's patents.  In the menu, you need to select Photo Shooting > Raw Recording > Lossless Compression to turn off HE.
+
+### Why is HE/HE★ smaller than nef-compactor?
+
+It's actually a lossy format, they're throwing data away to get that compression.
+
 
 ## Disclaimer
 
