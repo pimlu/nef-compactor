@@ -42,7 +42,8 @@ fn main() {
         meta.initial_predictors,
         meta.split_row,
     )
-    .expect("decode");
+    .expect("decode")
+    .pixels;
 
     // Write flat mosaic
     let bytes: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();

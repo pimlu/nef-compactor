@@ -128,7 +128,7 @@ pub fn compress<R: Read + Seek, W: Write>(
                 let height = chunks.raw_strip.height as usize;
                 let bps = chunks.raw_strip.bits_per_sample;
 
-                let pixels = nikon_lossless::decode(
+                let decode_result = nikon_lossless::decode(
                     &compressed_raw,
                     width,
                     height,
@@ -138,19 +138,34 @@ pub fn compress<R: Read + Seek, W: Write>(
                     meta.split_row,
                 )?;
 
+                // Split at the last fully-consumed byte boundary. Everything
+                // from that point on (the partial byte with padding bits, plus
+                // any trailing data) is the "tail" we preserve verbatim.
+                let full_bytes = decode_result.bits_consumed / 8;
+                let tail = if full_bytes < compressed_raw.len() {
+                    &compressed_raw[full_bytes..]
+                } else {
+                    &[]
+                };
+
                 let compressed_pixels = jxl::encode_pixels(
-                    &pixels,
+                    &decode_result.pixels,
                     chunks.raw_strip.width,
                     chunks.raw_strip.height,
                     bps,
                     effort,
                 )?;
 
+                let mut raw_payload = Vec::with_capacity(4 + compressed_pixels.len() + tail.len());
+                raw_payload.extend_from_slice(&(compressed_pixels.len() as u32).to_le_bytes());
+                raw_payload.extend_from_slice(&compressed_pixels);
+                raw_payload.extend_from_slice(tail);
+
                 segments.push(Segment {
                     seg_type: SegmentType::RawPixelsJxl,
                     original_offset: offset,
                     original_length: length,
-                    payload: compressed_pixels,
+                    payload: raw_payload,
                     raw_meta: Some(RawPixelsMeta {
                         width: chunks.raw_strip.width,
                         height: chunks.raw_strip.height,
@@ -321,7 +336,22 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
             }
             SegmentType::RawPixelsJxl => {
                 let m = raw_meta.unwrap();
-                let pixels = jxl::decode_pixels(&payload, m.width, m.height)?;
+                let needed = original_length as usize;
+
+                // Payload format: [jxl_len: u32 LE] [jxl_data] [tail]
+                // Older files without tail: raw payload is just jxl_data
+                let (jxl_data, tail) = if payload.len() >= 4 {
+                    let jxl_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                    if jxl_len + 4 <= payload.len() {
+                        (&payload[4..4 + jxl_len], &payload[4 + jxl_len..])
+                    } else {
+                        (payload.as_slice(), &[] as &[u8])
+                    }
+                } else {
+                    (payload.as_slice(), &[] as &[u8])
+                };
+
+                let pixels = jxl::decode_pixels(jxl_data, m.width, m.height)?;
 
                 let nikon_compressed = nikon_lossless::encode(
                     &pixels,
@@ -336,20 +366,16 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
                     m.split_row as usize,
                 )?;
 
-                // The Nikon encoder may produce fewer bytes than original due
-                // to trailing padding in the original strip. Pad to match.
-                let needed = original_length as usize;
-                if nikon_compressed.len() > needed {
-                    return Err(format!(
-                        "re-encoded raw strip {} bytes > original {} bytes",
-                        nikon_compressed.len(),
-                        needed,
-                    ));
-                }
-                out.write_all(&nikon_compressed).w()?;
-                if nikon_compressed.len() < needed {
-                    let pad = vec![0u8; needed - nikon_compressed.len()];
-                    out.write_all(&pad).w()?;
+                if !tail.is_empty() {
+                    let splice_pos = needed - tail.len();
+                    out.write_all(&nikon_compressed[..splice_pos]).w()?;
+                    out.write_all(tail).w()?;
+                } else {
+                    out.write_all(&nikon_compressed).w()?;
+                    if nikon_compressed.len() < needed {
+                        let pad = vec![0u8; needed - nikon_compressed.len()];
+                        out.write_all(&pad).w()?;
+                    }
                 }
                 reconstructed_size += needed as u64;
             }

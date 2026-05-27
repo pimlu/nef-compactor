@@ -208,7 +208,16 @@ fn jpeg_from_inline_pointers<R: Read + Seek>(
     }))
 }
 
+// JPEG XS start-of-codestream (SOC) + capabilities (CAP) marker pair
 const JPEG_XS_SOC_CAP: [u8; 4] = [0xFF, 0x10, 0xFF, 0x50];
+
+const MAKERNOTE_HEADER: &[u8; 6] = b"Nikon\0";
+const MAKERNOTE_HEADER_SIZE: usize = 10;
+
+// Nikon MakerNote tag IDs for the metadata blob containing Huffman
+// table selection, predictor init values, linearization curve, etc.
+const TAG_NEFMETA2: u16 = 0x0096;
+const TAG_NEFMETA1: u16 = 0x008C;
 
 fn detect_jpeg_xs<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<bool, String> {
     reader
@@ -242,22 +251,21 @@ pub fn read_nikon_lossless_meta<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(makernote_abs as u64))
         .map_err(|e| format!("seek MakerNote: {e}"))?;
-    let mut header = [0u8; 10];
+    let mut header = [0u8; MAKERNOTE_HEADER_SIZE];
     reader
         .read_exact(&mut header)
         .map_err(|e| format!("read MakerNote header: {e}"))?;
-    if &header[..6] != b"Nikon\0" {
+    if &header[..6] != MAKERNOTE_HEADER {
         return Err("not a Nikon MakerNote".into());
     }
 
-    let embedded_base = makernote_abs + 10;
+    let embedded_base = makernote_abs + MAKERNOTE_HEADER_SIZE;
     let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
     let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
 
-    // NefMeta2 (0x0096) or NefMeta1 (0x008C)
     let meta_entry = embedded
-        .find_entry(&nikon_ifd, 0x0096)
-        .or_else(|| embedded.find_entry(&nikon_ifd, 0x008C))
+        .find_entry(&nikon_ifd, TAG_NEFMETA2)
+        .or_else(|| embedded.find_entry(&nikon_ifd, TAG_NEFMETA1))
         .ok_or("no NefMeta tag")?;
 
     let meta_byte_size = meta_entry.byte_size();
@@ -270,6 +278,28 @@ pub fn read_nikon_lossless_meta<R: Read + Seek>(
 
     parse_nikon_meta(&meta_bytes, &embedded, chunks.raw_strip.bits_per_sample)
 }
+
+// NefMeta version bytes that select the Huffman table and curve format.
+// Names follow rawspeed/LibRaw conventions derived from dcraw.
+const NEFMETA_VER_LOSSLESS: u8 = 0x46;
+const NEFMETA_VER_LOSSY_CURVE: u8 = 0x44;
+const NEFMETA_V0_SKIP_2110: u8 = 0x49;
+const NEFMETA_V1_SKIP_2110: u8 = 0x58;
+// Lossy sub-variants that enable the linearization curve + split row
+const NEFMETA_V1_CURVE_NORMAL: u8 = 0x20;
+const NEFMETA_V1_CURVE_QUARTERED: u8 = 0x40;
+// Fixed byte offset of the split-row field within the NefMeta blob
+const NEFMETA_SPLIT_ROW_OFFSET: usize = 562;
+
+// Extra header bytes skipped for certain firmware versions.
+// This block contains encrypted WB/calibration data and precedes the
+// predictor init values.
+const NEFMETA_ENCRYPTED_BLOCK_SIZE: usize = 2110;
+
+// Huffman table indexing: tables 0-2 are 12-bit (lossy, lossy-after-split,
+// lossless), tables 3-5 are the 14-bit equivalents in the same order.
+const HUFF_TABLE_LOSSLESS_12: usize = 2;
+const HUFF_TABLE_14BIT_OFFSET: usize = 3;
 
 fn parse_nikon_meta(
     meta: &[u8],
@@ -284,16 +314,18 @@ fn parse_nikon_meta(
     let v1 = meta[1];
 
     let mut pos = 2usize;
-    if (v0 == 73 || v1 == 88) && pos + 2110 + 8 <= meta.len() {
-        pos += 2110;
+    if (v0 == NEFMETA_V0_SKIP_2110 || v1 == NEFMETA_V1_SKIP_2110)
+        && pos + NEFMETA_ENCRYPTED_BLOCK_SIZE + 8 <= meta.len()
+    {
+        pos += NEFMETA_ENCRYPTED_BLOCK_SIZE;
     }
 
     let mut huff_select: usize = 0;
-    if v0 == 70 {
-        huff_select = 2;
+    if v0 == NEFMETA_VER_LOSSLESS {
+        huff_select = HUFF_TABLE_LOSSLESS_12;
     }
     if bps == 14 {
-        huff_select += 3;
+        huff_select += HUFF_TABLE_14BIT_OFFSET;
     }
 
     if pos + 8 > meta.len() {
@@ -313,9 +345,12 @@ fn parse_nikon_meta(
 
     if pos + 2 <= meta.len() {
         let csize = read_u16(pos) as usize;
-        if v0 == 68 && (v1 == 32 || v1 == 64) && csize > 1 {
-            if 562 + 2 <= meta.len() {
-                split_row = read_u16(562) as usize;
+        if v0 == NEFMETA_VER_LOSSY_CURVE
+            && (v1 == NEFMETA_V1_CURVE_NORMAL || v1 == NEFMETA_V1_CURVE_QUARTERED)
+            && csize > 1
+        {
+            if NEFMETA_SPLIT_ROW_OFFSET + 2 <= meta.len() {
+                split_row = read_u16(NEFMETA_SPLIT_ROW_OFFSET) as usize;
             }
         }
     }
@@ -346,15 +381,15 @@ fn find_preview_image<R: Read + Seek>(
     reader
         .seek(std::io::SeekFrom::Start(makernote_abs as u64))
         .map_err(|e| format!("MakerNote seek: {e}"))?;
-    let mut header = [0u8; 10];
+    let mut header = [0u8; MAKERNOTE_HEADER_SIZE];
     if reader.read_exact(&mut header).is_err() {
         return Ok(None);
     }
-    if &header[..6] != b"Nikon\0" {
+    if &header[..6] != MAKERNOTE_HEADER {
         return Ok(None);
     }
 
-    let embedded_base = makernote_abs + 10;
+    let embedded_base = makernote_abs + MAKERNOTE_HEADER_SIZE;
     let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
     let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
 

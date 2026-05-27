@@ -45,7 +45,7 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
     let height = chunks.raw_strip.height as usize;
     let bps = chunks.raw_strip.bits_per_sample;
 
-    let pixels = nikon_lossless::decode(
+    let decode_result = nikon_lossless::decode(
         &compressed,
         width,
         height,
@@ -54,7 +54,8 @@ fn test_roundtrip(path: &Path) -> Result<(), String> {
         meta.initial_predictors,
         meta.split_row,
     )?;
-    println!("  decoded {} pixels", pixels.len());
+    let pixels = &decode_result.pixels;
+    println!("  decoded {} pixels, {} bits consumed", pixels.len(), decode_result.bits_consumed);
 
     let recompressed = nikon_lossless::encode(
         &pixels,

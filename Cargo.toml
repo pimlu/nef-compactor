@@ -8,6 +8,7 @@ repository = "https://github.com/pimlu/nef-compactor"
 readme = "README.md"
 keywords = ["nikon", "nef", "raw", "compression"]
 categories = ["command-line-utilities", "compression", "multimedia::images"]
+exclude = ["album/"]
 
 [dependencies]
 jpegxl-rs = { version = "0.11", features = ["vendored"] }

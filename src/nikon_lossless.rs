@@ -41,6 +41,10 @@ const NIKON_TREE: [[[u8; 16]; 2]; 6] = [
     ],
 ];
 
+// Nikon's special Huffman symbol: when the diff-magnitude nibble is 16,
+// the decoded difference is this fixed value instead of reading extra bits.
+const DIFF_SPECIAL_MINUS_32768: i32 = -32768;
+
 fn clamp_bits(val: i32, bits: u32) -> u16 {
     let max = (1i32 << bits) - 1;
     val.clamp(0, max) as u16
@@ -209,7 +213,7 @@ fn huff_decode_diff(bits: &mut BitReader, ht: &HuffTable) -> Result<i32, String>
         return Ok(0);
     }
     if len == 16 {
-        return Ok(-32768);
+        return Ok(DIFF_SPECIAL_MINUS_32768);
     }
 
     let extra = bits.get_bits(len) as i32;
@@ -221,9 +225,14 @@ fn huff_decode_diff(bits: &mut BitReader, ht: &HuffTable) -> Result<i32, String>
     Ok(diff)
 }
 
+pub struct DecodeResult {
+    pub pixels: Vec<u16>,
+    pub bits_consumed: usize,
+}
+
 /// Decode a Nikon lossless compressed raw strip to pre-curve pixel values.
-/// Returns the 2D pixel buffer (row-major, u16) without applying any
-/// linearization curve or dithering.
+/// Returns the pixel buffer and the number of bits consumed from the input,
+/// so callers can identify any trailing data beyond the encoded pixels.
 pub fn decode(
     compressed: &[u8],
     width: usize,
@@ -232,7 +241,7 @@ pub fn decode(
     huff_select: usize,
     initial_predictors: [[i32; 2]; 2],
     split_row: usize,
-) -> Result<Vec<u16>, String> {
+) -> Result<DecodeResult, String> {
     if width == 0 || height == 0 || width % 2 != 0 {
         return Err(format!("invalid dimensions {width}x{height}"));
     }
@@ -259,7 +268,10 @@ pub fn decode(
         }
     }
 
-    Ok(out)
+    Ok(DecodeResult {
+        pixels: out,
+        bits_consumed: bits.total_bits_consumed(),
+    })
 }
 
 // ─── Encode ──────────────────────────────────────────────────────────────────
@@ -270,7 +282,7 @@ fn encode_diff(writer: &mut BitWriter, ht: &HuffTable, diff: i32) {
         writer.write_bits(entry.code as u32, entry.code_len);
         return;
     }
-    if diff == -32768 {
+    if diff == DIFF_SPECIAL_MINUS_32768 {
         let entry = ht.find_entry_for_symbol(16).unwrap();
         writer.write_bits(entry.code as u32, entry.code_len);
         return;
@@ -378,7 +390,8 @@ mod tests {
         let pixels: Vec<u16> = vec![1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007];
 
         let encoded = encode(&pixels, width, height, bps, huff_select, initial_pred, 0).unwrap();
-        let decoded = decode(&encoded, width, height, bps, huff_select, initial_pred, 0).unwrap();
+        let result = decode(&encoded, width, height, bps, huff_select, initial_pred, 0).unwrap();
+        let decoded = result.pixels;
 
         assert_eq!(pixels, decoded);
     }

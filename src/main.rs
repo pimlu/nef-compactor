@@ -45,6 +45,30 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+fn collect_files(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!("warning: cannot read {}: {e}", d.display());
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some(extension) {
+                result.push(p);
+            }
+        }
+    }
+    result.sort();
+    result
+}
+
 // ─── Compress ────────────────────────────────────────────────────────────────
 
 struct CompressOpts {
@@ -133,7 +157,8 @@ fn cmd_compress_main(args: &[String]) {
         let out_path = opts
             .output
             .unwrap_or_else(|| opts.input.with_extension("CNEF"));
-        match compress_one(&opts.input, opts.effort, opts.skip_verify) {
+        let name = opts.input.file_name().unwrap().to_string_lossy();
+        match compress_one(&opts.input, &name, opts.effort, opts.skip_verify) {
             Ok(result) => {
                 if !opts.dry_run {
                     if let Some(ref data) = result.cnef_data {
@@ -188,6 +213,7 @@ fn print_compress_result(r: &CompressResult, verbose: bool, dry_run: bool) {
 /// Compress a single NEF to memory. Does NOT write to disk — caller decides.
 fn compress_one(
     input: &Path,
+    display_name: &str,
     effort: i64,
     skip_verify: bool,
 ) -> Result<CompressResult, String> {
@@ -255,10 +281,8 @@ fn compress_one(
         }
     }
 
-    let input_name = input.file_name().unwrap().to_string_lossy().to_string();
-
     Ok(CompressResult {
-        input_name,
+        input_name: display_name.to_string(),
         original_size,
         cnef_size,
         cnef_data: Some(cnef_buf),
@@ -273,18 +297,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         std::fs::create_dir_all(out_dir).expect("create output directory");
     }
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .expect("read directory")
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("NEF") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    files.sort();
+    let files = collect_files(dir, "NEF");
 
     if files.is_empty() {
         eprintln!("no NEF files found in {}", dir.display());
@@ -297,9 +310,24 @@ fn cmd_compress_dir(opts: &CompressOpts) {
             if opts.dry_run {
                 None
             } else {
-                let stem = f.file_stem().unwrap().to_string_lossy();
-                Some(out_dir.join(format!("{stem}.CNEF")))
+                let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
+                let mut dest = out_dir.join(rel);
+                dest.set_extension("CNEF");
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).expect("create output subdirectory");
+                }
+                Some(dest)
             }
+        })
+        .collect();
+
+    let display_names: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(dir)
+                .unwrap_or(f.as_path())
+                .to_string_lossy()
+                .into_owned()
         })
         .collect();
 
@@ -316,16 +344,16 @@ fn cmd_compress_dir(opts: &CompressOpts) {
 
     if opts.jobs <= 1 {
         for i in 0..n {
-            let result = compress_one(&files[i], effort, skip_verify);
+            let result = compress_one(&files[i], &display_names[i], effort, skip_verify);
             state.publish(i, result);
-            state.drain(&files, &out_paths, verbose, dry_run, remove_originals);
+            state.drain(&files, &display_names, &out_paths, verbose, dry_run, remove_originals);
         }
     } else {
         let next_idx = Mutex::new(0usize);
 
         std::thread::scope(|scope| {
             let drainer = scope.spawn(|| {
-                state.drain_blocking(n, &files, &out_paths, verbose, dry_run, remove_originals);
+                state.drain_blocking(n, &files, &display_names, &out_paths, verbose, dry_run, remove_originals);
             });
 
             for _ in 0..opts.jobs {
@@ -340,7 +368,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
                         i
                     };
 
-                    let result = compress_one(&files[idx], effort, skip_verify);
+                    let result = compress_one(&files[idx], &display_names[idx], effort, skip_verify);
                     state.publish(idx, result);
                 });
             }
@@ -390,6 +418,7 @@ impl StreamState {
     fn drain(
         &self,
         files: &[PathBuf],
+        display_names: &[String],
         out_paths: &[Option<PathBuf>],
         verbose: bool,
         dry_run: bool,
@@ -425,8 +454,7 @@ impl StreamState {
                     print_compress_result(&r, verbose, dry_run);
                 }
                 Err(e) => {
-                    let name = files[idx].file_name().unwrap().to_string_lossy();
-                    eprintln!("{name}: skipped ({e})");
+                    eprintln!("{}: skipped ({e})", display_names[idx]);
                     inner.failed += 1;
                 }
             }
@@ -437,13 +465,14 @@ impl StreamState {
         &self,
         n: usize,
         files: &[PathBuf],
+        display_names: &[String],
         out_paths: &[Option<PathBuf>],
         verbose: bool,
         dry_run: bool,
         remove_originals: bool,
     ) {
         loop {
-            self.drain(files, out_paths, verbose, dry_run, remove_originals);
+            self.drain(files, display_names, out_paths, verbose, dry_run, remove_originals);
             let inner = self.inner.lock().unwrap();
             if inner.next_print >= n {
                 return;
@@ -512,7 +541,8 @@ fn cmd_decompress_main(args: &[String]) {
             die(format!("-R requires a directory, got file: {}", input.display()));
         }
         let out_path = output.unwrap_or_else(|| input.with_extension("NEF"));
-        match decompress_one(&input) {
+        let name = input.file_name().unwrap().to_string_lossy();
+        match decompress_one(&input, &name) {
             Ok(r) => {
                 write_and_sync(&out_path, &r.nef_data).expect("write output NEF");
                 if remove_originals {
@@ -539,7 +569,7 @@ struct DecompressResult {
     nef_data: Vec<u8>,
 }
 
-fn decompress_one(input: &Path) -> Result<DecompressResult, String> {
+fn decompress_one(input: &Path, display_name: &str) -> Result<DecompressResult, String> {
     let mut cnef_file =
         std::fs::File::open(input).map_err(|e| format!("open: {e}"))?;
     let mut nef_buf = Vec::new();
@@ -547,7 +577,7 @@ fn decompress_one(input: &Path) -> Result<DecompressResult, String> {
     let stats = nef_compactor::cnef::decompress(&mut cnef_file, &mut nef_buf)?;
 
     Ok(DecompressResult {
-        input_name: input.file_name().unwrap().to_string_lossy().to_string(),
+        input_name: display_name.to_string(),
         original_size: stats.original_size,
         nef_data: nef_buf,
     })
@@ -556,18 +586,7 @@ fn decompress_one(input: &Path) -> Result<DecompressResult, String> {
 fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_originals: bool) {
     let out_dir = output.unwrap_or(dir);
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .expect("read directory")
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("CNEF") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    files.sort();
+    let files = collect_files(dir, "CNEF");
 
     if files.is_empty() {
         eprintln!("no CNEF files found in {}", dir.display());
@@ -577,8 +596,23 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
     let out_paths: Vec<PathBuf> = files
         .iter()
         .map(|f| {
-            let stem = f.file_stem().unwrap().to_string_lossy();
-            out_dir.join(format!("{stem}.NEF"))
+            let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
+            let mut dest = out_dir.join(rel);
+            dest.set_extension("NEF");
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).expect("create output subdirectory");
+            }
+            dest
+        })
+        .collect();
+
+    let display_names: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(dir)
+                .unwrap_or(f.as_path())
+                .to_string_lossy()
+                .into_owned()
         })
         .collect();
 
@@ -587,16 +621,16 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
 
     if jobs <= 1 {
         for i in 0..n {
-            let result = decompress_one(&files[i]);
+            let result = decompress_one(&files[i], &display_names[i]);
             state.publish(i, result);
-            state.drain(&files, &out_paths, remove_originals);
+            state.drain(&files, &display_names, &out_paths, remove_originals);
         }
     } else {
         let next_idx = Mutex::new(0usize);
 
         std::thread::scope(|scope| {
             let drainer = scope.spawn(|| {
-                state.drain_blocking(n, &files, &out_paths, remove_originals);
+                state.drain_blocking(n, &files, &display_names, &out_paths, remove_originals);
             });
 
             for _ in 0..jobs {
@@ -611,7 +645,7 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
                         i
                     };
 
-                    let result = decompress_one(&files[idx]);
+                    let result = decompress_one(&files[idx], &display_names[idx]);
                     state.publish(idx, result);
                 });
             }
@@ -661,6 +695,7 @@ impl DecompressStreamState {
     fn drain(
         &self,
         files: &[PathBuf],
+        display_names: &[String],
         out_paths: &[PathBuf],
         remove_originals: bool,
     ) {
@@ -693,8 +728,7 @@ impl DecompressStreamState {
                     );
                 }
                 Err(e) => {
-                    let name = files[idx].file_name().unwrap().to_string_lossy();
-                    eprintln!("{name}: failed ({e})");
+                    eprintln!("{}: failed ({e})", display_names[idx]);
                     inner.failed += 1;
                 }
             }
@@ -705,11 +739,12 @@ impl DecompressStreamState {
         &self,
         n: usize,
         files: &[PathBuf],
+        display_names: &[String],
         out_paths: &[PathBuf],
         remove_originals: bool,
     ) {
         loop {
-            self.drain(files, out_paths, remove_originals);
+            self.drain(files, display_names, out_paths, remove_originals);
             let inner = self.inner.lock().unwrap();
             if inner.next_print >= n {
                 return;
@@ -753,7 +788,7 @@ fn cmd_info(input: &PathBuf) {
 
         let w = chunks.raw_strip.width as usize;
         let h = chunks.raw_strip.height as usize;
-        let pixels = nef_compactor::nikon_lossless::decode(
+        let decode_result = nef_compactor::nikon_lossless::decode(
             &compressed,
             w,
             h,
@@ -763,6 +798,7 @@ fn cmd_info(input: &PathBuf) {
             meta.split_row,
         )
         .expect("decode");
+        let pixels = decode_result.pixels;
 
         let half_w = w / 2;
         let half_h = h / 2;
