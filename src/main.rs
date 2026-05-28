@@ -45,7 +45,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-fn collect_files(dir: &Path, extension: &str) -> Vec<PathBuf> {
+fn collect_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -60,13 +60,22 @@ fn collect_files(dir: &Path, extension: &str) -> Vec<PathBuf> {
             let p = entry.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if p.extension().and_then(|e| e.to_str()) == Some(extension) {
-                result.push(p);
+            } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if extensions.iter().any(|&e| e == ext) {
+                    result.push(p);
+                }
             }
         }
     }
     result.sort();
     result
+}
+
+fn output_extension<'a>(input: &Path, upper: &'a str, lower: &'a str) -> &'a str {
+    match input.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.chars().next().is_some_and(|c| c.is_ascii_lowercase()) => lower,
+        _ => upper,
+    }
 }
 
 // ─── Compress ────────────────────────────────────────────────────────────────
@@ -156,7 +165,7 @@ fn cmd_compress_main(args: &[String]) {
         }
         let out_path = opts
             .output
-            .unwrap_or_else(|| opts.input.with_extension("CNEF"));
+            .unwrap_or_else(|| opts.input.with_extension(output_extension(&opts.input, "CNEF", "cnef")));
         let name = opts.input.file_name().unwrap().to_string_lossy();
         match compress_one(&opts.input, &name, opts.effort, opts.skip_verify) {
             Ok(result) => {
@@ -223,7 +232,7 @@ fn compress_one(
     let chunks = nef_compactor::nef::scan_nef(&mut nef_file)?;
 
     if chunks.raw_strip.is_jpeg_xs {
-        return Err("HE/HE* NEF (JPEG XS raw strip), not supported".into());
+        return Err("HE/HE* NEF not supported (HE/HE* already lossy encodes the raw with JPEG XS)".into());
     }
 
     let lossless_meta = if chunks.raw_strip.compression
@@ -297,10 +306,10 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         std::fs::create_dir_all(out_dir).expect("create output directory");
     }
 
-    let files = collect_files(dir, "NEF");
+    let files = collect_files(dir, &["NEF", "nef"]);
 
     if files.is_empty() {
-        eprintln!("no NEF files found in {}", dir.display());
+        eprintln!("no .NEF/.nef files found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -312,7 +321,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
             } else {
                 let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
                 let mut dest = out_dir.join(rel);
-                dest.set_extension("CNEF");
+                dest.set_extension(output_extension(f, "CNEF", "cnef"));
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).expect("create output subdirectory");
                 }
@@ -540,7 +549,7 @@ fn cmd_decompress_main(args: &[String]) {
         if recursive {
             die(format!("-R requires a directory, got file: {}", input.display()));
         }
-        let out_path = output.unwrap_or_else(|| input.with_extension("NEF"));
+        let out_path = output.unwrap_or_else(|| input.with_extension(output_extension(&input, "NEF", "nef")));
         let name = input.file_name().unwrap().to_string_lossy();
         match decompress_one(&input, &name) {
             Ok(r) => {
@@ -586,10 +595,10 @@ fn decompress_one(input: &Path, display_name: &str) -> Result<DecompressResult, 
 fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_originals: bool) {
     let out_dir = output.unwrap_or(dir);
 
-    let files = collect_files(dir, "CNEF");
+    let files = collect_files(dir, &["CNEF", "cnef"]);
 
     if files.is_empty() {
-        eprintln!("no CNEF files found in {}", dir.display());
+        eprintln!("no .CNEF/.cnef files found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -598,7 +607,7 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
         .map(|f| {
             let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
             let mut dest = out_dir.join(rel);
-            dest.set_extension("NEF");
+            dest.set_extension(output_extension(f, "NEF", "nef"));
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).expect("create output subdirectory");
             }
