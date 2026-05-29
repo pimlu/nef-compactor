@@ -124,7 +124,7 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
                 if strip_length > 0 {
                     let is_bigger = raw_strip
                         .as_ref()
-                        .map_or(true, |r| width * height > r.width * r.height);
+                        .is_none_or(|r| width * height > r.width * r.height);
                     if is_bigger {
                         let is_jpeg_xs = detect_jpeg_xs(reader, strip_offset)?;
                         raw_strip = Some(RawStrip {
@@ -141,14 +141,9 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
             } else if compression == COMPRESSION_JPEG_OLD_STYLE || compression == COMPRESSION_JPEG
             {
                 if let Some(jpeg) = jpeg_from_inline_pointers(&main, reader, &entries)? {
-                    let bigger = match &best_jpeg {
-                        Some(existing)
-                            if existing.width * existing.height >= jpeg.width * jpeg.height =>
-                        {
-                            false
-                        }
-                        _ => true,
-                    };
+                    let bigger = best_jpeg
+                        .as_ref()
+                        .is_none_or(|e| jpeg.width * jpeg.height > e.width * e.height);
                     if bigger {
                         best_jpeg = Some(JpegChunk {
                             offset: jpeg.offset,
@@ -242,21 +237,15 @@ fn detect_jpeg_xs<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<bool, S
     Ok(buf == JPEG_XS_SOC_CAP)
 }
 
-pub fn read_nikon_lossless_meta<R: Read + Seek>(
+/// Parse a Nikon MakerNote entry: seek to it, validate the `"Nikon\0"` header,
+/// then parse the embedded TIFF that follows. Returns the embedded `TiffView`
+/// and its top-level Nikon IFD — the shared entry point for both the lossless
+/// metadata blob and the preview image.
+fn open_nikon_makernote<R: Read + Seek>(
+    main: &TiffView,
     reader: &mut R,
-    chunks: &NefChunks,
-) -> Result<NikonLosslessMeta, String> {
-    let main = &chunks.tiff_view;
-    let (_, ifd0_offset) = TiffView::parse_header(reader, 0)?;
-    let ifd0 = main.read_ifd(reader, ifd0_offset)?;
-
-    let exif_entry = main.find_entry(&ifd0, TAG_EXIF_IFD).ok_or("no ExifIFD")?;
-    let exif_offset = main.entry_scalar(exif_entry).ok_or("ExifIFD not scalar")?;
-    let exif_ifd = main.read_ifd(reader, exif_offset)?;
-
-    let makernote_entry = main
-        .find_entry(&exif_ifd, TAG_MAKERNOTE)
-        .ok_or("no MakerNote")?;
+    makernote_entry: &RawEntry,
+) -> Result<(TiffView, Vec<RawEntry>), String> {
     let makernote_rel = main.decode_u32(&makernote_entry.value_bytes);
     let makernote_abs = main.abs_from_ifd_offset(makernote_rel);
 
@@ -274,6 +263,25 @@ pub fn read_nikon_lossless_meta<R: Read + Seek>(
     let embedded_base = makernote_abs + MAKERNOTE_HEADER_SIZE;
     let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
     let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
+    Ok((embedded, nikon_ifd))
+}
+
+pub fn read_nikon_lossless_meta<R: Read + Seek>(
+    reader: &mut R,
+    chunks: &NefChunks,
+) -> Result<NikonLosslessMeta, String> {
+    let main = &chunks.tiff_view;
+    let (_, ifd0_offset) = TiffView::parse_header(reader, 0)?;
+    let ifd0 = main.read_ifd(reader, ifd0_offset)?;
+
+    let exif_entry = main.find_entry(&ifd0, TAG_EXIF_IFD).ok_or("no ExifIFD")?;
+    let exif_offset = main.entry_scalar(exif_entry).ok_or("ExifIFD not scalar")?;
+    let exif_ifd = main.read_ifd(reader, exif_offset)?;
+
+    let makernote_entry = main
+        .find_entry(&exif_ifd, TAG_MAKERNOTE)
+        .ok_or("no MakerNote")?;
+    let (embedded, nikon_ifd) = open_nikon_makernote(main, reader, makernote_entry)?;
 
     let meta_entry = embedded
         .find_entry(&nikon_ifd, TAG_NEFMETA2)
@@ -387,23 +395,11 @@ fn find_preview_image<R: Read + Seek>(
     if makernote_entry.count <= 4 {
         return Ok(None);
     }
-    let makernote_rel = main.decode_u32(&makernote_entry.value_bytes);
-    let makernote_abs = main.abs_from_ifd_offset(makernote_rel);
-
-    reader
-        .seek(std::io::SeekFrom::Start(makernote_abs as u64))
-        .map_err(|e| format!("MakerNote seek: {e}"))?;
-    let mut header = [0u8; MAKERNOTE_HEADER_SIZE];
-    if reader.read_exact(&mut header).is_err() {
+    // A preview is optional metadata: any malformed MakerNote just means "no
+    // preview", so swallow parse errors here rather than failing the whole scan.
+    let Ok((embedded, nikon_ifd)) = open_nikon_makernote(main, reader, makernote_entry) else {
         return Ok(None);
-    }
-    if &header[..6] != MAKERNOTE_HEADER {
-        return Ok(None);
-    }
-
-    let embedded_base = makernote_abs + MAKERNOTE_HEADER_SIZE;
-    let (embedded, nikon_ifd_offset) = TiffView::parse_header(reader, embedded_base)?;
-    let nikon_ifd = embedded.read_ifd(reader, nikon_ifd_offset)?;
+    };
 
     let preview_ifd_entry = match embedded.find_entry(&nikon_ifd, TAG_NIKON_PREVIEW_IFD) {
         Some(e) => e,

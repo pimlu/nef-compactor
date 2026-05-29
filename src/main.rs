@@ -97,6 +97,134 @@ fn decompressed_extension(input: &Path) -> String {
         .to_string()
 }
 
+/// File path relative to `dir`, as a lossy display string.
+fn relative_display_name(f: &Path, dir: &Path) -> String {
+    f.strip_prefix(dir)
+        .unwrap_or(f)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Output path for `f`: mirror its location under `dir` into `out_dir`, swapping
+/// the extension to `new_ext`. Creates the destination's parent directory.
+fn dest_path(f: &Path, dir: &Path, out_dir: &Path, new_ext: &str) -> PathBuf {
+    let rel = f.strip_prefix(dir).unwrap_or(f);
+    let mut dest = out_dir.join(rel);
+    dest.set_extension(new_ext);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).expect("create output subdirectory");
+    }
+    dest
+}
+
+fn write_and_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+// ─── Parallel streaming ────────────────────────────────────────────────────────
+
+/// Run `process` over indices `0..n` across `jobs` worker threads, then feed
+/// each result to `handle` in index order. `handle` runs on a single thread, so
+/// it can own mutable accumulator state without locking; `process` runs
+/// concurrently across the pool and so must be shareable.
+fn run_streaming<R: Send>(
+    n: usize,
+    jobs: usize,
+    process: impl Fn(usize) -> R + Sync,
+    mut handle: impl FnMut(usize, R) + Send,
+) {
+    let state = Slots::new(n);
+
+    if jobs <= 1 {
+        for i in 0..n {
+            let r = process(i);
+            state.publish(i, r);
+            state.drain(&mut handle);
+        }
+        return;
+    }
+
+    let next_idx = Mutex::new(0usize);
+    std::thread::scope(|scope| {
+        scope.spawn(|| state.drain_blocking(n, &mut handle));
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let idx = {
+                    let mut next = next_idx.lock().unwrap();
+                    if *next >= n {
+                        return;
+                    }
+                    let i = *next;
+                    *next += 1;
+                    i
+                };
+                let r = process(idx);
+                state.publish(idx, r);
+            });
+        }
+    });
+}
+
+/// In-order result collector: workers `publish` results into indexed slots in
+/// any order; a single consumer `drain`s them strictly in index order so output
+/// stays deterministic regardless of which job finishes first.
+struct Slots<R> {
+    inner: Mutex<SlotsInner<R>>,
+    cond: Condvar,
+}
+
+struct SlotsInner<R> {
+    slots: Vec<Option<R>>,
+    next: usize,
+}
+
+impl<R> Slots<R> {
+    fn new(n: usize) -> Self {
+        Slots {
+            inner: Mutex::new(SlotsInner {
+                slots: (0..n).map(|_| None).collect(),
+                next: 0,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, idx: usize, value: R) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots[idx] = Some(value);
+        self.cond.notify_all();
+    }
+
+    /// Hand every consecutive ready slot, starting at `next`, to `handle`.
+    fn drain(&self, handle: &mut impl FnMut(usize, R)) {
+        let mut inner = self.inner.lock().unwrap();
+        while inner.next < inner.slots.len() {
+            let idx = inner.next;
+            let Some(value) = inner.slots[idx].take() else {
+                break;
+            };
+            inner.next += 1;
+            handle(idx, value);
+        }
+    }
+
+    /// Block until all `n` slots have been drained.
+    fn drain_blocking(&self, n: usize, handle: &mut impl FnMut(usize, R)) {
+        loop {
+            self.drain(handle);
+            let inner = self.inner.lock().unwrap();
+            if inner.next >= n {
+                return;
+            }
+            let _unused = self.cond.wait(inner).unwrap();
+        }
+    }
+}
+
 // ─── Compress ────────────────────────────────────────────────────────────────
 
 struct CompressOpts {
@@ -160,14 +288,6 @@ fn parse_compress_args(args: &[String]) -> CompressOpts {
         input: positional.remove(0),
         output: positional.into_iter().next(),
     }
-}
-
-fn write_and_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    Ok(())
 }
 
 fn cmd_compress_main(args: &[String]) {
@@ -351,202 +471,56 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         std::process::exit(1);
     }
 
+    let display_names: Vec<String> = files.iter().map(|f| relative_display_name(f, dir)).collect();
     let out_paths: Vec<Option<PathBuf>> = files
         .iter()
-        .map(|f| {
-            if opts.dry_run {
-                None
-            } else {
-                let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
-                let mut dest = out_dir.join(rel);
-                dest.set_extension(compressed_extension(f));
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).expect("create output subdirectory");
-                }
-                Some(dest)
-            }
-        })
+        .map(|f| (!opts.dry_run).then(|| dest_path(f, dir, out_dir, &compressed_extension(f))))
         .collect();
 
-    let display_names: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.strip_prefix(dir)
-                .unwrap_or(f.as_path())
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
+    let mut compressed = 0u64;
+    let mut failed = 0u64;
+    let mut total_original = 0u64;
+    let mut total_cnef = 0u64;
 
-    let effort = opts.effort;
-    let skip_verify = opts.skip_verify;
-    let verbose = opts.verbose;
-    let dry_run = opts.dry_run;
-    let remove_originals = opts.remove_originals;
-
-    // Shared state for in-order streaming output
-    let state = StreamState::new(files.len());
-
-    let n = files.len();
-
-    if opts.jobs <= 1 {
-        for i in 0..n {
-            let result = compress_one(&files[i], &display_names[i], effort, skip_verify);
-            state.publish(i, result);
-            state.drain(&files, &display_names, &out_paths, verbose, dry_run, remove_originals);
-        }
-    } else {
-        let next_idx = Mutex::new(0usize);
-
-        std::thread::scope(|scope| {
-            let drainer = scope.spawn(|| {
-                state.drain_blocking(n, &files, &display_names, &out_paths, verbose, dry_run, remove_originals);
-            });
-
-            for _ in 0..opts.jobs {
-                scope.spawn(|| loop {
-                    let idx = {
-                        let mut next = next_idx.lock().unwrap();
-                        if *next >= n {
-                            return;
-                        }
-                        let i = *next;
-                        *next += 1;
-                        i
-                    };
-
-                    let result = compress_one(&files[idx], &display_names[idx], effort, skip_verify);
-                    state.publish(idx, result);
-                });
-            }
-
-            drainer.join().unwrap();
-        });
-    }
-
-    state.print_summary(files.len());
-}
-
-struct StreamState {
-    inner: Mutex<StreamInner>,
-    cond: Condvar,
-}
-
-struct StreamInner {
-    slots: Vec<Option<Result<CompressResult, String>>>,
-    next_print: usize,
-    compressed: u64,
-    failed: u64,
-    total_original: u64,
-    total_cnef: u64,
-}
-
-impl StreamState {
-    fn new(n: usize) -> Self {
-        StreamState {
-            inner: Mutex::new(StreamInner {
-                slots: (0..n).map(|_| None).collect(),
-                next_print: 0,
-                compressed: 0,
-                failed: 0,
-                total_original: 0,
-                total_cnef: 0,
-            }),
-            cond: Condvar::new(),
-        }
-    }
-
-    fn publish(&self, idx: usize, result: Result<CompressResult, String>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.slots[idx] = Some(result);
-        self.cond.notify_all();
-    }
-
-    fn drain(
-        &self,
-        files: &[PathBuf],
-        display_names: &[String],
-        out_paths: &[Option<PathBuf>],
-        verbose: bool,
-        dry_run: bool,
-        remove_originals: bool,
-    ) {
-        let mut inner = self.inner.lock().unwrap();
-        while inner.next_print < inner.slots.len() {
-            let idx = inner.next_print;
-            let Some(result) = inner.slots[idx].take() else {
-                break;
-            };
-            inner.next_print += 1;
-
-            match result {
-                Ok(r) => {
-                    if !dry_run {
-                        if let (Some(data), Some(path)) = (&r.cnef_data, &out_paths[idx]) {
-                            if let Err(e) = write_and_sync(path, data) {
-                                eprintln!("{}: write failed ({e})", r.input_name);
-                                inner.failed += 1;
-                                continue;
-                            }
-                            if remove_originals {
-                                if let Err(e) = std::fs::remove_file(&files[idx]) {
-                                    eprintln!("{}: remove failed ({e})", r.input_name);
-                                }
-                            }
+    run_streaming(
+        files.len(),
+        opts.jobs,
+        |i| compress_one(&files[i], &display_names[i], opts.effort, opts.skip_verify),
+        |idx, result| match result {
+            Ok(r) => {
+                if let (Some(path), Some(data)) = (&out_paths[idx], &r.cnef_data) {
+                    if let Err(e) = write_and_sync(path, data) {
+                        eprintln!("{}: write failed ({e})", r.input_name);
+                        failed += 1;
+                        return;
+                    }
+                    if opts.remove_originals {
+                        if let Err(e) = std::fs::remove_file(&files[idx]) {
+                            eprintln!("{}: remove failed ({e})", r.input_name);
                         }
                     }
-                    inner.compressed += 1;
-                    inner.total_original += r.original_size;
-                    inner.total_cnef += r.cnef_size;
-                    print_compress_result(&r, verbose, dry_run);
                 }
-                Err(e) => {
-                    eprintln!("{}: skipped ({e})", display_names[idx]);
-                    inner.failed += 1;
-                }
+                compressed += 1;
+                total_original += r.original_size;
+                total_cnef += r.cnef_size;
+                print_compress_result(&r, opts.verbose, opts.dry_run);
             }
-        }
-    }
-
-    fn drain_blocking(
-        &self,
-        n: usize,
-        files: &[PathBuf],
-        display_names: &[String],
-        out_paths: &[Option<PathBuf>],
-        verbose: bool,
-        dry_run: bool,
-        remove_originals: bool,
-    ) {
-        loop {
-            self.drain(files, display_names, out_paths, verbose, dry_run, remove_originals);
-            let inner = self.inner.lock().unwrap();
-            if inner.next_print >= n {
-                return;
+            Err(e) => {
+                eprintln!("{}: skipped ({e})", display_names[idx]);
+                failed += 1;
             }
-            let _unused = self.cond.wait(inner).unwrap();
-        }
-    }
+        },
+    );
 
-    fn print_summary(&self, total_files: usize) {
-        let inner = self.inner.lock().unwrap();
-        let total_ratio = if inner.total_original > 0 {
-            inner.total_cnef as f64 / inner.total_original as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        println!();
-        println!(
-            "Summary: {} compressed, {} skipped, {} total",
-            inner.compressed, inner.failed, total_files,
-        );
-        if inner.compressed > 0 {
-            println!(
-                "  total: {} → {} bytes ({:.1}%)",
-                inner.total_original, inner.total_cnef, total_ratio,
-            );
-        }
+    let total_ratio = if total_original > 0 {
+        total_cnef as f64 / total_original as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!();
+    println!("Summary: {compressed} compressed, {failed} skipped, {} total", files.len());
+    if compressed > 0 {
+        println!("  total: {total_original} → {total_cnef} bytes ({total_ratio:.1}%)");
     }
 }
 
@@ -640,165 +614,47 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
         std::process::exit(1);
     }
 
+    let display_names: Vec<String> = files.iter().map(|f| relative_display_name(f, dir)).collect();
     let out_paths: Vec<PathBuf> = files
         .iter()
-        .map(|f| {
-            let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
-            let mut dest = out_dir.join(rel);
-            dest.set_extension(decompressed_extension(f));
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).expect("create output subdirectory");
-            }
-            dest
-        })
+        .map(|f| dest_path(f, dir, out_dir, &decompressed_extension(f)))
         .collect();
 
-    let display_names: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.strip_prefix(dir)
-                .unwrap_or(f.as_path())
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
 
-    let n = files.len();
-    let state = DecompressStreamState::new(n);
-
-    if jobs <= 1 {
-        for i in 0..n {
-            let result = decompress_one(&files[i], &display_names[i]);
-            state.publish(i, result);
-            state.drain(&files, &display_names, &out_paths, remove_originals);
-        }
-    } else {
-        let next_idx = Mutex::new(0usize);
-
-        std::thread::scope(|scope| {
-            let drainer = scope.spawn(|| {
-                state.drain_blocking(n, &files, &display_names, &out_paths, remove_originals);
-            });
-
-            for _ in 0..jobs {
-                scope.spawn(|| loop {
-                    let idx = {
-                        let mut next = next_idx.lock().unwrap();
-                        if *next >= n {
-                            return;
-                        }
-                        let i = *next;
-                        *next += 1;
-                        i
-                    };
-
-                    let result = decompress_one(&files[idx], &display_names[idx]);
-                    state.publish(idx, result);
-                });
+    run_streaming(
+        files.len(),
+        jobs,
+        |i| decompress_one(&files[i], &display_names[i]),
+        |idx, result| match result {
+            Ok(r) => {
+                if let Err(e) = write_and_sync(&out_paths[idx], &r.nef_data) {
+                    eprintln!("{}: write failed ({e})", r.input_name);
+                    failed += 1;
+                    return;
+                }
+                if remove_originals {
+                    if let Err(e) = std::fs::remove_file(&files[idx]) {
+                        eprintln!("{}: remove failed ({e})", r.input_name);
+                    }
+                }
+                succeeded += 1;
+                println!(
+                    "{} → {} ({} bytes)",
+                    r.input_name,
+                    out_paths[idx].file_name().unwrap().to_string_lossy(),
+                    r.original_size,
+                );
             }
-
-            drainer.join().unwrap();
-        });
-    }
-
-    let inner = state.inner.lock().unwrap();
-    println!(
-        "\nSummary: {} decompressed, {} failed, {} total",
-        inner.succeeded, inner.failed, n,
+            Err(e) => {
+                eprintln!("{}: failed ({e})", display_names[idx]);
+                failed += 1;
+            }
+        },
     );
-}
 
-struct DecompressStreamState {
-    inner: Mutex<DecompressStreamInner>,
-    cond: Condvar,
-}
-
-struct DecompressStreamInner {
-    slots: Vec<Option<Result<DecompressResult, String>>>,
-    next_print: usize,
-    succeeded: u64,
-    failed: u64,
-}
-
-impl DecompressStreamState {
-    fn new(n: usize) -> Self {
-        DecompressStreamState {
-            inner: Mutex::new(DecompressStreamInner {
-                slots: (0..n).map(|_| None).collect(),
-                next_print: 0,
-                succeeded: 0,
-                failed: 0,
-            }),
-            cond: Condvar::new(),
-        }
-    }
-
-    fn publish(&self, idx: usize, result: Result<DecompressResult, String>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.slots[idx] = Some(result);
-        self.cond.notify_all();
-    }
-
-    fn drain(
-        &self,
-        files: &[PathBuf],
-        display_names: &[String],
-        out_paths: &[PathBuf],
-        remove_originals: bool,
-    ) {
-        let mut inner = self.inner.lock().unwrap();
-        while inner.next_print < inner.slots.len() {
-            let idx = inner.next_print;
-            let Some(result) = inner.slots[idx].take() else {
-                break;
-            };
-            inner.next_print += 1;
-
-            match result {
-                Ok(r) => {
-                    if let Err(e) = write_and_sync(&out_paths[idx], &r.nef_data) {
-                        eprintln!("{}: write failed ({e})", r.input_name);
-                        inner.failed += 1;
-                        continue;
-                    }
-                    if remove_originals {
-                        if let Err(e) = std::fs::remove_file(&files[idx]) {
-                            eprintln!("{}: remove failed ({e})", r.input_name);
-                        }
-                    }
-                    inner.succeeded += 1;
-                    println!(
-                        "{} → {} ({} bytes)",
-                        r.input_name,
-                        out_paths[idx].file_name().unwrap().to_string_lossy(),
-                        r.original_size,
-                    );
-                }
-                Err(e) => {
-                    eprintln!("{}: failed ({e})", display_names[idx]);
-                    inner.failed += 1;
-                }
-            }
-        }
-    }
-
-    fn drain_blocking(
-        &self,
-        n: usize,
-        files: &[PathBuf],
-        display_names: &[String],
-        out_paths: &[PathBuf],
-        remove_originals: bool,
-    ) {
-        loop {
-            self.drain(files, display_names, out_paths, remove_originals);
-            let inner = self.inner.lock().unwrap();
-            if inner.next_print >= n {
-                return;
-            }
-            let _unused = self.cond.wait(inner).unwrap();
-        }
-    }
+    println!("\nSummary: {succeeded} decompressed, {failed} failed, {} total", files.len());
 }
 
 // ─── Info ────────────────────────────────────────────────────────────────────

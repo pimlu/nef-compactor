@@ -435,7 +435,7 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
 
         match seg_type {
             SegmentType::Zstd => {
-                let decompressed = zstd_decompress(&payload, original_length as usize)?;
+                let decompressed = zstd_decompress(&payload)?;
                 out.write_all(&decompressed).w()?;
                 reconstructed_size += decompressed.len() as u64;
             }
@@ -603,7 +603,7 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("zstd compress: {e}"))
 }
 
-fn zstd_decompress(data: &[u8], _expected_size: usize) -> Result<Vec<u8>, String> {
+fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd::decode_all(std::io::Cursor::new(data)).map_err(|e| format!("zstd decompress: {e}"))
 }
 

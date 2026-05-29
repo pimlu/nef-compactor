@@ -162,12 +162,11 @@ unsafe fn encode_4ch_ffi(
         "SetExtraChannelInfo",
     )?;
 
-    let mut color = unsafe {
+    let color = unsafe {
         let mut c = MaybeUninit::uninit();
         JxlColorEncodingSetToSRGB(c.as_mut_ptr(), false);
         c.assume_init()
     };
-    let _ = &mut color;
     enc_check(
         unsafe { JxlEncoderSetColorEncoding(enc, &color) },
         "SetColorEncoding",
