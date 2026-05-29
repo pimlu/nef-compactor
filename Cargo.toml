@@ -32,3 +32,11 @@ required-features = ["debug-tools"]
 
 [features]
 debug-tools = []
+
+# Optimized build that still panics on arithmetic overflow. The intentional
+# wrapping in the codec uses explicit wrapping_*/`as` casts, so this only traps
+# *accidental* overflow. Build/run with `--profile release-checked`
+# (binary at target/release-checked/). The default release stays fast.
+[profile.release-checked]
+inherits = "release"
+overflow-checks = true
