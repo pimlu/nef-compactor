@@ -73,7 +73,7 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
     let mut best_jpeg: Option<JpegChunk> = None;
 
     if let Some(subifds_entry) = main.find_entry(&ifd0, TAG_SUB_IFDS) {
-        let subifd_offsets = main.entry_long_array(reader, subifds_entry)?;
+        let subifd_offsets = main.entry_u32_array(reader, subifds_entry)?;
         for offset in subifd_offsets {
             let entries = match main.read_ifd(reader, offset) {
                 Ok(e) => e,
@@ -95,15 +95,27 @@ pub fn scan_nef<R: Read + Seek>(reader: &mut R) -> Result<NefChunks, String> {
                 .unwrap_or(0);
 
             if compression == COMPRESSION_NIKON_LOSSLESS || compression == 1 {
-                // Raw strip
-                let strip_offset = main
+                // Raw strip. Uncompressed NEFs split the image into many strips,
+                // so read the offset/byte-count arrays and treat the whole span
+                // as a single region (the strips are stored contiguously).
+                let offsets = main
                     .find_entry(&entries, TAG_STRIP_OFFSETS)
-                    .and_then(|e| main.entry_scalar(e))
-                    .unwrap_or(0) as u64;
-                let strip_length = main
+                    .map(|e| main.entry_u32_array(reader, e))
+                    .transpose()?
+                    .unwrap_or_default();
+                let counts = main
                     .find_entry(&entries, TAG_STRIP_BYTE_COUNTS)
-                    .and_then(|e| main.entry_scalar(e))
-                    .unwrap_or(0) as u64;
+                    .map(|e| main.entry_u32_array(reader, e))
+                    .transpose()?
+                    .unwrap_or_default();
+                let strip_offset = offsets.iter().copied().min().unwrap_or(0) as u64;
+                let strip_end = offsets
+                    .iter()
+                    .zip(&counts)
+                    .map(|(&o, &c)| o as u64 + c as u64)
+                    .max()
+                    .unwrap_or(0);
+                let strip_length = strip_end.saturating_sub(strip_offset);
                 let bps = main
                     .find_entry(&entries, TAG_BITS_PER_SAMPLE)
                     .and_then(|e| main.entry_scalar(e))

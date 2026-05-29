@@ -163,33 +163,37 @@ impl TiffView {
         }
     }
 
-    pub fn entry_long_array<R: Read + Seek>(
+    /// Read an entry's values as `u32`, handling SHORT or LONG fields and both
+    /// the inline (≤4 byte) and out-of-line (offset) cases. Used for SubIFD
+    /// pointers and for multi-strip offset / byte-count arrays.
+    pub fn entry_u32_array<R: Read + Seek>(
         &self,
         reader: &mut R,
         e: &RawEntry,
     ) -> Result<Vec<u32>, String> {
-        if e.field_type != TYPE_LONG {
-            return Err(format!("TIFF: expected LONG type, got {}", e.field_type));
-        }
+        let elem_size = match e.field_type {
+            TYPE_SHORT => 2,
+            TYPE_LONG => 4,
+            other => return Err(format!("TIFF: expected SHORT/LONG array, got type {other}")),
+        };
         let n = e.count as usize;
         if n == 0 {
             return Ok(Vec::new());
         }
-        if n == 1 {
-            return Ok(vec![self.decode_u32(&e.value_bytes)]);
-        }
-        let array_offset = self.decode_u32(&e.value_bytes);
-        let abs = self.abs_from_ifd_offset(array_offset);
-        reader
-            .seek(SeekFrom::Start(abs as u64))
-            .map_err(|e| format!("TIFF: LONG array seek to {abs}: {e}"))?;
-        let mut buf = vec![0u8; n * 4];
-        reader
-            .read_exact(&mut buf)
-            .map_err(|e| format!("TIFF: LONG array read at {abs}: {e}"))?;
+        let total = n * elem_size;
+        let bytes = if total <= 4 {
+            e.value_bytes[..total].to_vec()
+        } else {
+            let abs = self.abs_from_ifd_offset(self.decode_u32(&e.value_bytes));
+            self.read_bytes(reader, abs as u64, total)?
+        };
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(self.decode_u32(&buf[i * 4..i * 4 + 4]));
+            let chunk = &bytes[i * elem_size..(i + 1) * elem_size];
+            out.push(match e.field_type {
+                TYPE_SHORT => self.decode_u16(chunk) as u32,
+                _ => self.decode_u32(chunk),
+            });
         }
         Ok(out)
     }

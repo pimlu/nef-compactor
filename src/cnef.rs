@@ -31,7 +31,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use crate::jxl;
 use crate::nef::{NefChunks, NikonLosslessMeta};
 use crate::nikon_lossless;
-use crate::tiff::COMPRESSION_NIKON_LOSSLESS;
+use crate::packed;
 
 const MAGIC: &[u8; 4] = b"CNEF";
 const VERSION: u8 = 1;
@@ -44,6 +44,14 @@ pub enum SegmentType {
     Zstd = 1,
     RawPixelsJxl = 2,
     JpegJxl = 3,
+    /// Bit-packed uncompressed raw, recompressed as lossless JPEG XL. Added
+    /// after v1; old readers reject it via `from_u8` (the file simply requires a
+    /// newer binary), so no format version bump is needed.
+    RawUncompressedJxl = 4,
+    /// Like `RawPixelsJxl`, but the stored values are biased into a compact
+    /// non-negative range (lossy frames can run the predictor out of range);
+    /// the payload is prefixed with the `i32` bias. Also added after v1.
+    RawPixelsBiasedJxl = 5,
 }
 
 impl SegmentType {
@@ -52,9 +60,66 @@ impl SegmentType {
             1 => Ok(Self::Zstd),
             2 => Ok(Self::RawPixelsJxl),
             3 => Ok(Self::JpegJxl),
+            4 => Ok(Self::RawUncompressedJxl),
+            5 => Ok(Self::RawPixelsBiasedJxl),
             _ => Err(format!("unknown segment type {v}")),
         }
     }
+
+    fn has_raw_meta(self) -> bool {
+        matches!(
+            self,
+            Self::RawPixelsJxl | Self::RawUncompressedJxl | Self::RawPixelsBiasedJxl
+        )
+    }
+}
+
+/// Choose how to feed decoded lossless pixels to JXL. Normally the stored
+/// values are in `[0, 2^bps)` and go in unchanged (`bias` is `None`). A lossy
+/// frame can run the predictor out of range — values wrap near 65535 — which
+/// wrecks JXL; shift them by the minimum into a compact non-negative range and
+/// return the bias so decompression can undo it. The shift cancels out of the
+/// prediction diffs, so the re-encode is unaffected.
+fn bias_pixels(pixels: Vec<u16>, bps: u32) -> (Vec<u16>, u32, Option<i32>) {
+    let limit = 1i32 << bps;
+    let signed = |p: u16| p as i16 as i32; // recover the (possibly negative) predictor
+    let mut lo = i32::MAX;
+    let mut hi = i32::MIN;
+    let mut out_of_range = false;
+    for &p in &pixels {
+        let s = signed(p);
+        lo = lo.min(s);
+        hi = hi.max(s);
+        if s < 0 || s >= limit {
+            out_of_range = true;
+        }
+    }
+    if !out_of_range {
+        return (pixels, bps, None);
+    }
+    let biased: Vec<u16> = pixels.iter().map(|&p| (signed(p) - lo) as u16).collect();
+    let span = (hi - lo) as u32; // < 2^16 since signed values fit in i16
+    let jxl_bps = (32 - span.leading_zeros()).max(1);
+    (biased, jxl_bps, Some(lo))
+}
+
+/// Split a raw payload `[jxl_len: u32 LE][jxl_data][tail]` into (jxl, tail).
+fn split_jxl_payload(payload: &[u8]) -> (&[u8], &[u8]) {
+    if payload.len() >= 4 {
+        let jxl_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+        if jxl_len + 4 <= payload.len() {
+            return (&payload[4..4 + jxl_len], &payload[4 + jxl_len..]);
+        }
+    }
+    (payload, &[])
+}
+
+/// How the original raw strip is encoded, decided by the caller before
+/// compression. Lossless is the Nikon Huffman format; Uncompressed is
+/// bit-packed samples (some bodies mislabel these as Nikon-compressed).
+pub enum RawSource {
+    Lossless(NikonLosslessMeta),
+    Uncompressed,
 }
 
 struct Segment {
@@ -78,26 +143,19 @@ struct RawPixelsMeta {
 pub fn compress<R: Read + Seek, W: Write>(
     nef: &mut R,
     chunks: &NefChunks,
-    lossless_meta: Option<&NikonLosslessMeta>,
+    raw_source: &RawSource,
     effort: i64,
     out: &mut W,
 ) -> Result<CompressionStats, String> {
     let mut regions: Vec<(u64, u64, RegionKind)> = Vec::new();
 
-    // Collect all chunk regions
-    if chunks.raw_strip.compression == COMPRESSION_NIKON_LOSSLESS && lossless_meta.is_some() {
-        regions.push((
-            chunks.raw_strip.offset,
-            chunks.raw_strip.length,
-            RegionKind::RawStrip,
-        ));
-    } else {
-        regions.push((
-            chunks.raw_strip.offset,
-            chunks.raw_strip.length,
-            RegionKind::Blob,
-        ));
-    }
+    // Collect all chunk regions. The raw strip is always Nikon lossless here —
+    // callers reject other formats before reaching this point.
+    regions.push((
+        chunks.raw_strip.offset,
+        chunks.raw_strip.length,
+        RegionKind::RawStrip,
+    ));
     for jpeg in &chunks.jpegs {
         regions.push((jpeg.offset, jpeg.length as u64, RegionKind::Jpeg));
     }
@@ -122,51 +180,105 @@ pub fn compress<R: Read + Seek, W: Write>(
 
         match kind {
             RegionKind::RawStrip => {
-                let meta = lossless_meta.unwrap();
                 let compressed_raw = read_range(nef, offset, length as usize)?;
                 let width = chunks.raw_strip.width as usize;
                 let height = chunks.raw_strip.height as usize;
                 let bps = chunks.raw_strip.bits_per_sample;
 
-                let decode_result = nikon_lossless::decode(
-                    &compressed_raw,
-                    width,
-                    height,
-                    bps,
-                    meta.huff_select,
-                    meta.initial_predictors,
-                    meta.split_row,
-                )?;
+                let (seg_type, pixels, tail, jxl_bps, prefix) = match raw_source {
+                    RawSource::Lossless(meta) => {
+                        let decode_result = nikon_lossless::decode(
+                            &compressed_raw,
+                            width,
+                            height,
+                            bps,
+                            meta.huff_select,
+                            meta.initial_predictors,
+                            meta.split_row,
+                        )?;
 
-                // Split at the last fully-consumed byte boundary. Everything
-                // from that point on (the partial byte with padding bits, plus
-                // any trailing data) is the "tail" we preserve verbatim.
-                let full_bytes = decode_result.bits_consumed / 8;
-                let tail = if full_bytes < compressed_raw.len() {
-                    &compressed_raw[full_bytes..]
-                } else {
-                    &[]
+                        // Split at the last fully-consumed byte boundary; the
+                        // partial final byte plus any trailing data is the
+                        // "tail" we preserve verbatim.
+                        let full_bytes =
+                            (decode_result.bits_consumed / 8).min(compressed_raw.len());
+                        let tail = compressed_raw[full_bytes..].to_vec();
+
+                        // Confirm the strip round-trips bit-exactly before the
+                        // expensive JXL encode. Any failure — a mismatch or an
+                        // encode error (a diff category absent from the table,
+                        // i.e. the data isn't really our format) — means an
+                        // unsupported variant: skip cleanly here rather than
+                        // emit a broken CNEF or fail verify late.
+                        let round_trips = reconstruct_raw_strip(
+                            &decode_result.pixels,
+                            width,
+                            height,
+                            bps,
+                            meta.huff_select,
+                            meta.initial_predictors,
+                            meta.split_row,
+                            &tail,
+                            length as usize,
+                        )
+                        .map(|check| check == compressed_raw)
+                        .unwrap_or(false);
+                        if !round_trips {
+                            return Err("unsupported Nikon lossless variant (raw strip does not round-trip)".into());
+                        }
+                        // Lossy frames can run the predictor out of range; bias
+                        // such values into a compact range (recorded in the
+                        // payload) so JXL isn't fed wrap-around spikes.
+                        let (jxl_pixels, jxl_bps, bias) = bias_pixels(decode_result.pixels, bps);
+                        match bias {
+                            Some(b) => (
+                                SegmentType::RawPixelsBiasedJxl,
+                                jxl_pixels,
+                                tail,
+                                jxl_bps,
+                                b.to_le_bytes().to_vec(),
+                            ),
+                            None => (SegmentType::RawPixelsJxl, jxl_pixels, tail, jxl_bps, Vec::new()),
+                        }
+                    }
+                    RawSource::Uncompressed => {
+                        let layout = packed::Layout::detect(length as usize, width, height, bps)
+                            .ok_or("uncompressed raw: irregular row layout")?;
+                        let pixels = packed::unpack(&compressed_raw, width, height, layout);
+                        // The samples must repack to the exact original bytes
+                        // (i.e. padding is zero); otherwise skip cleanly.
+                        if packed::pack(&pixels, width, height, layout) != compressed_raw {
+                            return Err(
+                                "uncompressed raw does not repack exactly (non-zero padding?)".into(),
+                            );
+                        }
+                        (
+                            SegmentType::RawUncompressedJxl,
+                            pixels,
+                            Vec::new(),
+                            layout.jxl_bps(),
+                            Vec::new(),
+                        )
+                    }
                 };
 
                 let compressed_pixels = jxl::encode_pixels(
-                    &decode_result.pixels,
+                    &pixels,
                     chunks.raw_strip.width,
                     chunks.raw_strip.height,
-                    bps,
+                    jxl_bps,
                     effort,
                 )?;
 
-                let mut raw_payload = Vec::with_capacity(4 + compressed_pixels.len() + tail.len());
+                let mut raw_payload =
+                    Vec::with_capacity(prefix.len() + 4 + compressed_pixels.len() + tail.len());
+                raw_payload.extend_from_slice(&prefix);
                 raw_payload.extend_from_slice(&(compressed_pixels.len() as u32).to_le_bytes());
                 raw_payload.extend_from_slice(&compressed_pixels);
-                raw_payload.extend_from_slice(tail);
+                raw_payload.extend_from_slice(&tail);
 
-                segments.push(Segment {
-                    seg_type: SegmentType::RawPixelsJxl,
-                    original_offset: offset,
-                    original_length: length,
-                    payload: raw_payload,
-                    raw_meta: Some(RawPixelsMeta {
+                let raw_meta = match raw_source {
+                    RawSource::Lossless(meta) => RawPixelsMeta {
                         width: chunks.raw_strip.width,
                         height: chunks.raw_strip.height,
                         bits_per_sample: bps as u8,
@@ -178,7 +290,23 @@ pub fn compress<R: Read + Seek, W: Write>(
                             meta.initial_predictors[1][0],
                             meta.initial_predictors[1][1],
                         ],
-                    }),
+                    },
+                    RawSource::Uncompressed => RawPixelsMeta {
+                        width: chunks.raw_strip.width,
+                        height: chunks.raw_strip.height,
+                        bits_per_sample: bps as u8,
+                        huff_select: 0,
+                        split_row: 0,
+                        initial_predictors: [0; 4],
+                    },
+                };
+
+                segments.push(Segment {
+                    seg_type,
+                    original_offset: offset,
+                    original_length: length,
+                    payload: raw_payload,
+                    raw_meta: Some(raw_meta),
                 });
             }
             RegionKind::Jpeg => {
@@ -189,16 +317,6 @@ pub fn compress<R: Read + Seek, W: Write>(
                     original_offset: offset,
                     original_length: length,
                     payload: jxl_data,
-                    raw_meta: None,
-                });
-            }
-            RegionKind::Blob => {
-                let data = read_range(nef, offset, length as usize)?;
-                segments.push(Segment {
-                    seg_type: SegmentType::Zstd,
-                    original_offset: offset,
-                    original_length: length,
-                    payload: zstd_compress(&data)?,
                     raw_meta: None,
                 });
             }
@@ -294,7 +412,7 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
         let original_length = read_u64_le(input)?;
         let compressed_length = read_u64_le(input)? as usize;
 
-        let raw_meta = if seg_type == SegmentType::RawPixelsJxl {
+        let raw_meta = if seg_type.has_raw_meta() {
             Some(RawPixelsMeta {
                 width: read_u32_le(input)?,
                 height: read_u32_le(input)?,
@@ -334,26 +452,29 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
                 out.write_all(&jpeg_bytes).w()?;
                 reconstructed_size += needed as u64;
             }
-            SegmentType::RawPixelsJxl => {
+            SegmentType::RawPixelsJxl | SegmentType::RawPixelsBiasedJxl => {
                 let m = raw_meta.unwrap();
                 let needed = original_length as usize;
 
-                // Payload format: [jxl_len: u32 LE] [jxl_data] [tail]
-                // Older files without tail: raw payload is just jxl_data
-                let (jxl_data, tail) = if payload.len() >= 4 {
-                    let jxl_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-                    if jxl_len + 4 <= payload.len() {
-                        (&payload[4..4 + jxl_len], &payload[4 + jxl_len..])
-                    } else {
-                        (payload.as_slice(), &[] as &[u8])
+                // Biased segments prefix the payload with an i32 bias to undo.
+                let (bias, body) = if seg_type == SegmentType::RawPixelsBiasedJxl {
+                    if payload.len() < 4 {
+                        return Err("biased raw segment: payload too short".into());
                     }
+                    (i32::from_le_bytes(payload[..4].try_into().unwrap()), &payload[4..])
                 } else {
-                    (payload.as_slice(), &[] as &[u8])
+                    (0, payload.as_slice())
                 };
 
-                let pixels = jxl::decode_pixels(jxl_data, m.width, m.height)?;
+                let (jxl_data, tail) = split_jxl_payload(body);
+                let decoded = jxl::decode_pixels(jxl_data, m.width, m.height)?;
+                let pixels: Vec<u16> = if bias != 0 {
+                    decoded.iter().map(|&p| (p as i32 + bias) as u16).collect()
+                } else {
+                    decoded
+                };
 
-                let nikon_compressed = nikon_lossless::encode(
+                let strip = reconstruct_raw_strip(
                     &pixels,
                     m.width as usize,
                     m.height as usize,
@@ -364,20 +485,31 @@ pub fn decompress<R: Read, W: Write>(input: &mut R, out: &mut W) -> Result<Decom
                         [m.initial_predictors[2], m.initial_predictors[3]],
                     ],
                     m.split_row as usize,
+                    tail,
+                    needed,
                 )?;
+                out.write_all(&strip).w()?;
+                reconstructed_size += strip.len() as u64;
+            }
+            SegmentType::RawUncompressedJxl => {
+                let m = raw_meta.unwrap();
+                let needed = original_length as usize;
+                let height = m.height as usize;
 
-                if !tail.is_empty() {
-                    let splice_pos = needed - tail.len();
-                    out.write_all(&nikon_compressed[..splice_pos]).w()?;
-                    out.write_all(tail).w()?;
-                } else {
-                    out.write_all(&nikon_compressed).w()?;
-                    if nikon_compressed.len() < needed {
-                        let pad = vec![0u8; needed - nikon_compressed.len()];
-                        out.write_all(&pad).w()?;
-                    }
+                let (jxl_data, _tail) = split_jxl_payload(&payload);
+                let pixels = jxl::decode_pixels(jxl_data, m.width, m.height)?;
+
+                let layout = packed::Layout::detect(needed, m.width as usize, height, m.bits_per_sample as u32)
+                    .ok_or("uncompressed segment: irregular row layout")?;
+                let strip = packed::pack(&pixels, m.width as usize, height, layout);
+                if strip.len() != needed {
+                    return Err(format!(
+                        "uncompressed repack size {} != expected {needed}",
+                        strip.len()
+                    ));
                 }
-                reconstructed_size += needed as u64;
+                out.write_all(&strip).w()?;
+                reconstructed_size += strip.len() as u64;
             }
         }
     }
@@ -417,7 +549,42 @@ pub struct DecompressionStats {
 enum RegionKind {
     RawStrip,
     Jpeg,
-    Blob,
+}
+
+/// Re-encode decoded raw pixels back into the Nikon bitstream and fit it to
+/// exactly `needed` bytes — the inverse of the RawStrip decode in `compress`.
+///
+/// The original strip is `needed` bytes. We splice the preserved `tail` (the
+/// final partial byte + any trailing data) over the re-encoded body, then
+/// truncate-or-pad the body to fill the rest. Truncation matters for lossy
+/// streams whose pixel count slightly exceeds what the bitstream encodes: the
+/// decoder over-runs into end-of-stream padding, so the re-encode is a few
+/// bytes too long, but its leading `needed` bytes still match the original
+/// exactly. Both `compress` (as a round-trip self-check) and `decompress` go
+/// through here so they cannot disagree.
+fn reconstruct_raw_strip(
+    pixels: &[u16],
+    width: usize,
+    height: usize,
+    bps: u32,
+    huff_select: usize,
+    predictors: [[i32; 2]; 2],
+    split_row: usize,
+    tail: &[u8],
+    needed: usize,
+) -> Result<Vec<u8>, String> {
+    let reencoded =
+        nikon_lossless::encode(pixels, width, height, bps, huff_select, predictors, split_row)?;
+    if tail.len() > needed {
+        return Err("raw strip tail longer than strip length".into());
+    }
+    let body_len = needed - tail.len();
+    let mut out = Vec::with_capacity(needed);
+    let copy = reencoded.len().min(body_len);
+    out.extend_from_slice(&reencoded[..copy]);
+    out.resize(body_len, 0); // pad if the re-encode came up short
+    out.extend_from_slice(tail);
+    Ok(out)
 }
 
 fn read_range<R: Read + Seek>(reader: &mut R, offset: u64, length: usize) -> Result<Vec<u8>, String> {

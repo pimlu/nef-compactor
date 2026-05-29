@@ -71,11 +71,30 @@ fn collect_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     result
 }
 
-fn output_extension<'a>(input: &Path, upper: &'a str, lower: &'a str) -> &'a str {
-    match input.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.chars().next().is_some_and(|c| c.is_ascii_lowercase()) => lower,
-        _ => upper,
-    }
+/// Raw extensions we operate on, and their compressed counterparts, are
+/// related by a leading 'C'/'c': NEF↔CNEF, nef↔cnef, NRW↔CNRW, nrw↔cnrw.
+const RAW_EXTENSIONS: &[&str] = &["NEF", "nef", "NRW", "nrw"];
+const COMPRESSED_EXTENSIONS: &[&str] = &["CNEF", "cnef", "CNRW", "cnrw"];
+
+/// Compressed-side extension for a raw input: prepend 'C'/'c' to the input
+/// extension, matching its case (NEF→CNEF, nrw→cnrw).
+fn compressed_extension(input: &Path) -> String {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("NEF");
+    let c = if ext.starts_with(|c: char| c.is_ascii_lowercase()) {
+        'c'
+    } else {
+        'C'
+    };
+    format!("{c}{ext}")
+}
+
+/// Inverse of `compressed_extension`: strip the leading 'C'/'c'
+/// (CNEF→NEF, cnrw→nrw).
+fn decompressed_extension(input: &Path) -> String {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("NEF");
+    ext.strip_prefix(|c: char| c == 'C' || c == 'c')
+        .unwrap_or(ext)
+        .to_string()
 }
 
 // ─── Compress ────────────────────────────────────────────────────────────────
@@ -165,7 +184,7 @@ fn cmd_compress_main(args: &[String]) {
         }
         let out_path = opts
             .output
-            .unwrap_or_else(|| opts.input.with_extension(output_extension(&opts.input, "CNEF", "cnef")));
+            .unwrap_or_else(|| opts.input.with_extension(compressed_extension(&opts.input)));
         let name = opts.input.file_name().unwrap().to_string_lossy();
         match compress_one(&opts.input, &name, opts.effort, opts.skip_verify) {
             Ok(result) => {
@@ -205,6 +224,8 @@ fn print_compress_result(r: &CompressResult, verbose: bool, dry_run: bool) {
                 nef_compactor::cnef::SegmentType::Zstd => "zstd",
                 nef_compactor::cnef::SegmentType::RawPixelsJxl => "raw→jxl",
                 nef_compactor::cnef::SegmentType::JpegJxl => "jpeg→jxl",
+                nef_compactor::cnef::SegmentType::RawUncompressedJxl => "raw(unc)→jxl",
+                nef_compactor::cnef::SegmentType::RawPixelsBiasedJxl => "raw(bias)→jxl",
             };
             let seg_ratio = if seg.original_size > 0 {
                 seg.compressed_size as f64 / seg.original_size as f64 * 100.0
@@ -235,21 +256,38 @@ fn compress_one(
         return Err("HE/HE* NEF not supported (HE/HE* already lossy encodes the raw with JPEG XS)".into());
     }
 
-    let lossless_meta = if chunks.raw_strip.compression
-        == nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS
+    let rs = &chunks.raw_strip;
+    let pixels = rs.width as u64 * rs.height as u64;
+
+    // sNEF "small RAW" stores 3 bytes/pixel of YCbCr instead of a Bayer stream;
+    // the lossless tag lies. Detect it by size and skip with a clear note.
+    if rs.length == pixels * 3 {
+        return Err("sNEF (YCbCr small RAW) not supported".into());
+    }
+
+    // A real Nikon Huffman strip is always smaller than the packed samples. A
+    // strip at or above packed size is uncompressed raw (compression=1, or on
+    // some bodies mislabelled as Nikon Compressed) — recompressed by unpacking
+    // the samples and feeding them through the same JPEG XL path.
+    let packed_size = pixels * rs.bits_per_sample as u64 / 8;
+    let raw_source = if rs.compression == nef_compactor::tiff::COMPRESSION_NIKON_LOSSLESS
+        && rs.length < packed_size
     {
-        match nef_compactor::nef::read_nikon_lossless_meta(&mut nef_file, &chunks) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!(
-                    "  warning: {}: can't read lossless meta ({e}), raw strip will use zstd",
-                    input.display()
-                );
-                None
-            }
-        }
+        nef_compactor::cnef::RawSource::Lossless(
+            nef_compactor::nef::read_nikon_lossless_meta(&mut nef_file, &chunks)
+                .map_err(|e| format!("Nikon raw linearization metadata not found ({e})"))?,
+        )
     } else {
-        None
+        // Uncompressed: we repack row by row, so the strip must divide evenly
+        // into rows (it always does in practice; guard to be safe).
+        let h = rs.height as u64;
+        if h == 0 || rs.length % h != 0 {
+            return Err(format!(
+                "uncompressed raw with irregular layout ({} bytes / {} rows)",
+                rs.length, rs.height
+            ));
+        }
+        nef_compactor::cnef::RawSource::Uncompressed
     };
 
     let original_size = chunks.file_size;
@@ -258,7 +296,7 @@ fn compress_one(
     let stats = nef_compactor::cnef::compress(
         &mut nef_file,
         &chunks,
-        lossless_meta.as_ref(),
+        &raw_source,
         effort,
         &mut cnef_buf,
     )?;
@@ -306,10 +344,10 @@ fn cmd_compress_dir(opts: &CompressOpts) {
         std::fs::create_dir_all(out_dir).expect("create output directory");
     }
 
-    let files = collect_files(dir, &["NEF", "nef"]);
+    let files = collect_files(dir, RAW_EXTENSIONS);
 
     if files.is_empty() {
-        eprintln!("no .NEF/.nef files found in {}", dir.display());
+        eprintln!("no .NEF/.nef/.NRW/.nrw files found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -321,7 +359,7 @@ fn cmd_compress_dir(opts: &CompressOpts) {
             } else {
                 let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
                 let mut dest = out_dir.join(rel);
-                dest.set_extension(output_extension(f, "CNEF", "cnef"));
+                dest.set_extension(compressed_extension(f));
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).expect("create output subdirectory");
                 }
@@ -549,7 +587,7 @@ fn cmd_decompress_main(args: &[String]) {
         if recursive {
             die(format!("-R requires a directory, got file: {}", input.display()));
         }
-        let out_path = output.unwrap_or_else(|| input.with_extension(output_extension(&input, "NEF", "nef")));
+        let out_path = output.unwrap_or_else(|| input.with_extension(decompressed_extension(&input)));
         let name = input.file_name().unwrap().to_string_lossy();
         match decompress_one(&input, &name) {
             Ok(r) => {
@@ -595,10 +633,10 @@ fn decompress_one(input: &Path, display_name: &str) -> Result<DecompressResult, 
 fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_originals: bool) {
     let out_dir = output.unwrap_or(dir);
 
-    let files = collect_files(dir, &["CNEF", "cnef"]);
+    let files = collect_files(dir, COMPRESSED_EXTENSIONS);
 
     if files.is_empty() {
-        eprintln!("no .CNEF/.cnef files found in {}", dir.display());
+        eprintln!("no .CNEF/.cnef/.CNRW/.cnrw files found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -607,7 +645,7 @@ fn cmd_decompress_dir(dir: &Path, output: Option<&Path>, jobs: usize, remove_ori
         .map(|f| {
             let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
             let mut dest = out_dir.join(rel);
-            dest.set_extension(output_extension(f, "NEF", "nef"));
+            dest.set_extension(decompressed_extension(f));
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).expect("create output subdirectory");
             }

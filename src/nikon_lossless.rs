@@ -8,6 +8,11 @@
 
 // Predefined Huffman table sets. Index 0-2: 12-bit (lossy, lossy-after-split,
 // lossless). Index 3-5: 14-bit (same order). Each has [code_lengths; symbols].
+//
+// A symbol's low nibble is the diff magnitude category (number of payload
+// bits); the high nibble is a left-shift used only by the lossy "after split"
+// tables (1, 4) to drop low-order bits — i.e. the lossy quantization. The
+// lossless tables (2, 5) and no-split lossy tables (0, 3) always have shift 0.
 const NIKON_TREE: [[[u8; 16]; 2]; 6] = [
     [
         // 12-bit lossy
@@ -17,7 +22,7 @@ const NIKON_TREE: [[[u8; 16]; 2]; 6] = [
     [
         // 12-bit lossy after split
         [0, 1, 5, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0],
-        [0x39, 0x5a, 0x38, 0x27, 0x16, 5, 4, 3, 2, 1, 0, 11, 12, 0, 0, 0],
+        [0x39, 0x5a, 0x38, 0x27, 0x16, 5, 4, 3, 2, 1, 0, 11, 12, 12, 0, 0],
     ],
     [
         // 12-bit lossless
@@ -40,15 +45,6 @@ const NIKON_TREE: [[[u8; 16]; 2]; 6] = [
         [7, 6, 8, 5, 9, 4, 10, 3, 11, 12, 2, 0, 1, 13, 14, 0],
     ],
 ];
-
-// Nikon's special Huffman symbol: when the diff-magnitude nibble is 16,
-// the decoded difference is this fixed value instead of reading extra bits.
-const DIFF_SPECIAL_MINUS_32768: i32 = -32768;
-
-fn clamp_bits(val: i32, bits: u32) -> u16 {
-    let max = (1i32 << bits) - 1;
-    val.clamp(0, max) as u16
-}
 
 // ─── Huffman table ───────────────────────────────────────────────────────────
 
@@ -106,8 +102,11 @@ impl HuffTable {
         }
     }
 
-    fn find_entry_for_symbol(&self, symbol: u8) -> Option<&HuffEntry> {
-        self.entries.iter().find(|e| e.symbol == symbol)
+    /// Find the entry whose magnitude category (low nibble) matches `len`.
+    /// For the shifted "after split" tables the symbol byte also carries a
+    /// shift in its high nibble, so we can't match on the raw symbol value.
+    fn find_entry_for_len(&self, len: u8) -> Option<&HuffEntry> {
+        self.entries.iter().find(|e| (e.symbol & 0x0F) == len)
     }
 }
 
@@ -147,7 +146,10 @@ impl<'a> BitReader<'a> {
 
     fn consume_bits(&mut self, n: u32) {
         self.bit_buf <<= n;
-        self.bits_left -= n;
+        // Saturate rather than wrap: a code at the very end of the stream can
+        // ask for more bits than remain (the decoder is reading the final
+        // zero-padding). Clamping keeps `total_bits_consumed` sane.
+        self.bits_left = self.bits_left.saturating_sub(n);
     }
 
     fn get_bits(&mut self, n: u32) -> u32 {
@@ -156,9 +158,8 @@ impl<'a> BitReader<'a> {
         val
     }
 
-    #[allow(dead_code)]
     fn total_bits_consumed(&self) -> usize {
-        self.byte_pos * 8 - self.bits_left as usize
+        (self.byte_pos * 8).saturating_sub(self.bits_left as usize)
     }
 }
 
@@ -209,19 +210,20 @@ fn huff_decode_diff(bits: &mut BitReader, ht: &HuffTable) -> Result<i32, String>
     bits.consume_bits(code_len as u32);
 
     let len = (symbol & 0x0F) as u32;
+    let shl = (symbol >> 4) as u32;
     if len == 0 {
         return Ok(0);
     }
-    if len == 16 {
-        return Ok(DIFF_SPECIAL_MINUS_32768);
-    }
 
-    let extra = bits.get_bits(len) as i32;
-    let diff = if (extra & (1 << (len - 1))) == 0 {
-        extra - ((1i32 << len) - 1)
-    } else {
-        extra
-    };
+    // Read `len - shl` payload bits, then reinsert the `shl` forced-zero
+    // low-order bits. For the lossless tables shl == 0 and this is the
+    // ordinary JPEG magnitude-category decode.
+    let extra = bits.get_bits(len - shl);
+    let diff_raw = (((extra << 1) + 1) << shl) >> 1;
+    let mut diff = diff_raw as i32;
+    if (diff_raw & (1 << (len - 1))) == 0 {
+        diff -= (1i32 << len) - if shl == 0 { 1 } else { 0 };
+    }
     Ok(diff)
 }
 
@@ -237,7 +239,7 @@ pub fn decode(
     compressed: &[u8],
     width: usize,
     height: usize,
-    bits_per_sample: u32,
+    _bits_per_sample: u32,
     huff_select: usize,
     initial_predictors: [[i32; 2]; 2],
     split_row: usize,
@@ -245,7 +247,6 @@ pub fn decode(
     if width == 0 || height == 0 || width % 2 != 0 {
         return Err(format!("invalid dimensions {width}x{height}"));
     }
-    let bps = bits_per_sample;
 
     let mut bits = BitReader::new(compressed);
     let mut ht = HuffTable::build(huff_select);
@@ -260,11 +261,18 @@ pub fn decode(
 
         let mut pred = p_up[row & 1];
         for col in 0..width {
-            pred[col & 1] += huff_decode_diff(&mut bits, &ht)?;
+            // Accumulate with wrapping: only the low 16 bits are stored, and a
+            // corrupt stream shouldn't be able to overflow-panic a debug build.
+            pred[col & 1] = pred[col & 1].wrapping_add(huff_decode_diff(&mut bits, &ht)?);
             if col < 2 {
                 p_up[row & 1][col & 1] = pred[col & 1];
             }
-            out[row * width + col] = clamp_bits(pred[col & 1], bps);
+            // Store the predictor's low 16 bits rather than clamping to the
+            // sample range. The reference decoders keep the predictor chain
+            // unclamped (lossy frames can run it out of range); clamping here
+            // would make the re-encode diverge. Diffs are always within ±2^15,
+            // so they're recovered exactly from consecutive values mod 2^16.
+            out[row * width + col] = pred[col & 1] as u16;
         }
     }
 
@@ -276,34 +284,43 @@ pub fn decode(
 
 // ─── Encode ──────────────────────────────────────────────────────────────────
 
-fn encode_diff(writer: &mut BitWriter, ht: &HuffTable, diff: i32) {
+fn encode_diff(writer: &mut BitWriter, ht: &HuffTable, diff: i32) -> Result<(), String> {
     if diff == 0 {
-        let entry = ht.find_entry_for_symbol(0).unwrap();
+        let entry = ht.find_entry_for_len(0).ok_or("Huffman: table has no zero symbol")?;
         writer.write_bits(entry.code as u32, entry.code_len);
-        return;
-    }
-    if diff == DIFF_SPECIAL_MINUS_32768 {
-        let entry = ht.find_entry_for_symbol(16).unwrap();
-        writer.write_bits(entry.code as u32, entry.code_len);
-        return;
+        return Ok(());
     }
 
-    let abs_diff = diff.unsigned_abs() as u32;
-    let len = 32 - abs_diff.leading_zeros(); // number of bits needed
-    let extra = if diff < 0 {
-        (diff + ((1i32 << len) - 1)) as u32
+    let abs_diff = diff.unsigned_abs();
+    let len = 32 - abs_diff.leading_zeros(); // magnitude category
+    let entry = ht.find_entry_for_len(len as u8).ok_or_else(|| {
+        format!("Huffman: diff {diff} needs {len}-bit category absent from this table")
+    })?;
+    let shl = (entry.symbol >> 4) as u32;
+
+    // Invert huff_decode_diff: undo the sign extension to recover diff_raw,
+    // then strip the `shl` forced low bits to recover the payload. For shl == 0
+    // this is the ordinary JPEG magnitude-category encode (extra == diff_raw).
+    let diff_raw = if diff < 0 {
+        (diff + (1i32 << len) - if shl == 0 { 1 } else { 0 }) as u32
     } else {
         diff as u32
     };
+    let extra = if shl == 0 {
+        diff_raw
+    } else {
+        ((diff_raw >> (shl - 1)) - 1) >> 1
+    };
 
-    let entry = ht.find_entry_for_symbol(len as u8).unwrap();
     writer.write_bits(entry.code as u32, entry.code_len);
-    writer.write_bits(extra, len as u8);
+    writer.write_bits(extra, (len - shl) as u8);
+    Ok(())
 }
 
-/// Encode pre-curve pixel values back into a Nikon lossless compressed
-/// bitstream. The inverse of `decode`. Pixel values must be the unclamped
-/// pre-curve values (i.e., what `decode` produces).
+/// Encode pixel values back into a Nikon lossless compressed bitstream. The
+/// inverse of `decode`. Pixel values are the stored values `decode` produces
+/// (the predictor's low 16 bits); diffs are taken mod 2^16 and recovered
+/// exactly because they're always within ±2^15.
 pub fn encode(
     pixels: &[u16],
     width: usize,
@@ -328,7 +345,8 @@ pub fn encode(
     let mut writer = BitWriter::new();
     let mut ht = HuffTable::build(huff_select);
 
-    let mut p_up = initial_predictors;
+    // Predictors as u16 (the low 16 bits decode stores); diffs are mod 2^16.
+    let mut p_up = initial_predictors.map(|row| [row[0] as u16, row[1] as u16]);
 
     for row in 0..height {
         if split_row > 0 && row == split_row {
@@ -337,12 +355,12 @@ pub fn encode(
 
         let mut pred = p_up[row & 1];
         for col in 0..width {
-            let pixel = pixels[row * width + col] as i32;
-            let diff = pixel - pred[col & 1];
-            encode_diff(&mut writer, &ht, diff);
-            pred[col & 1] += diff;
+            let pixel = pixels[row * width + col];
+            let diff = pixel.wrapping_sub(pred[col & 1]) as i16 as i32;
+            encode_diff(&mut writer, &ht, diff)?;
+            pred[col & 1] = pixel;
             if col < 2 {
-                p_up[row & 1][col & 1] = pred[col & 1];
+                p_up[row & 1][col & 1] = pixel;
             }
         }
     }
@@ -366,7 +384,7 @@ mod tests {
 
             for diff in -max_val..=max_val {
                 let mut writer = BitWriter::new();
-                encode_diff(&mut writer, &ht, diff);
+                encode_diff(&mut writer, &ht, diff).unwrap();
                 let encoded = writer.finish();
 
                 let mut reader = BitReader::new(&encoded);
@@ -375,6 +393,43 @@ mod tests {
                     diff, decoded,
                     "table {table_idx}: diff {diff} roundtrip failed"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn shifted_tables_roundtrip() {
+        // The lossy "after split" tables (1, 4) carry a shift in the symbol's
+        // high nibble. Enumerate every representable diff (by decoding every
+        // payload value for every symbol) and confirm encode∘decode is identity.
+        for table_idx in [1, 4] {
+            let ht = HuffTable::build(table_idx);
+
+            let mut diffs = std::collections::BTreeSet::new();
+            for entry in &ht.entries {
+                let len = (entry.symbol & 0x0F) as u32;
+                let shl = (entry.symbol >> 4) as u32;
+                if len == 0 {
+                    diffs.insert(0i32);
+                    continue;
+                }
+                for e in 0..(1u32 << (len - shl)) {
+                    let diff_raw = (((e << 1) + 1) << shl) >> 1;
+                    let mut diff = diff_raw as i32;
+                    if (diff_raw & (1 << (len - 1))) == 0 {
+                        diff -= (1i32 << len) - if shl == 0 { 1 } else { 0 };
+                    }
+                    diffs.insert(diff);
+                }
+            }
+
+            for &diff in &diffs {
+                let mut writer = BitWriter::new();
+                encode_diff(&mut writer, &ht, diff).unwrap();
+                let encoded = writer.finish();
+                let mut reader = BitReader::new(&encoded);
+                let decoded = huff_decode_diff(&mut reader, &ht).unwrap();
+                assert_eq!(diff, decoded, "table {table_idx}: diff {diff} roundtrip failed");
             }
         }
     }
